@@ -6,9 +6,16 @@ use tracing::{debug, info};
 use voxel_core::{BlockState, CHUNK_SIZE, ChunkCoord, VoxelCoord};
 use voxel_mesh::{ChunkMesh, mesh_chunk_greedy};
 use voxel_render::{FrameStats, NullRenderer, RenderError, RenderScene, RendererBackend};
+use voxel_vulkan::{VulkanRenderer, VulkanRendererConfig};
 use voxel_world::{
     BlockRegistry, ChunkProvider, ChunkStreamingState, GeneratedWorld, InMemoryEditLogStore,
     StreamPlanner, TerrainGenerator,
+};
+use winit::{
+    application::ApplicationHandler,
+    event::WindowEvent,
+    event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    window::{Window, WindowAttributes, WindowId},
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -43,6 +50,42 @@ pub enum RuntimeStage {
     Mesh,
     Upload,
     Render,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VulkanAppKind {
+    Sandbox,
+    ShaderLab,
+}
+
+#[derive(Clone, Debug)]
+pub struct WindowedVulkanAppConfig {
+    pub title: String,
+    pub kind: VulkanAppKind,
+    pub runtime: RuntimeConfig,
+}
+
+impl WindowedVulkanAppConfig {
+    pub fn sandbox() -> Self {
+        Self {
+            title: "Voxel Sandbox".to_owned(),
+            kind: VulkanAppKind::Sandbox,
+            runtime: RuntimeConfig::default(),
+        }
+    }
+
+    pub fn shader_lab() -> Self {
+        Self {
+            title: "Voxel Shader Lab".to_owned(),
+            kind: VulkanAppKind::ShaderLab,
+            runtime: RuntimeConfig {
+                horizontal_view_distance: 0,
+                vertical_view_distance: 0,
+                max_chunk_jobs_per_tick: 1,
+                ..RuntimeConfig::default()
+            },
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -167,6 +210,10 @@ impl<R: RendererBackend> EngineRuntime<R> {
         &self.scene
     }
 
+    pub fn renderer_mut(&mut self) -> &mut R {
+        &mut self.renderer
+    }
+
     pub fn edit_block(&mut self, voxel: VoxelCoord, state: BlockState) {
         self.world.edit_block(voxel, state);
         let (coord, _) = voxel.split_chunk_local();
@@ -284,6 +331,108 @@ pub fn install_tracing() {
         .try_init();
     debug!("tracing initialized");
     info!("voxel runtime ready");
+}
+
+pub fn run_windowed_vulkan_app(
+    config: WindowedVulkanAppConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    install_tracing();
+    let event_loop = EventLoop::new()?;
+    event_loop.set_control_flow(ControlFlow::Poll);
+    event_loop.run_app(WindowedVulkanApp::new(config))?;
+    Ok(())
+}
+
+struct WindowedVulkanApp {
+    runtime: Option<EngineRuntime<VulkanRenderer>>,
+    window: Option<Box<dyn Window>>,
+    window_id: Option<WindowId>,
+    config: WindowedVulkanAppConfig,
+}
+
+impl WindowedVulkanApp {
+    fn new(config: WindowedVulkanAppConfig) -> Self {
+        Self {
+            runtime: None,
+            window: None,
+            window_id: None,
+            config,
+        }
+    }
+
+    fn initialize(
+        &mut self,
+        event_loop: &dyn ActiveEventLoop,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        if self.window.is_some() {
+            return Ok(());
+        }
+
+        let window = event_loop.create_window(
+            WindowAttributes::default()
+                .with_title(self.config.title.clone())
+                .with_visible(true),
+        )?;
+        let size = window.surface_size();
+        let extent = [size.width.max(1), size.height.max(1)];
+        let renderer = VulkanRenderer::new_for_window_with_extent(
+            VulkanRendererConfig {
+                application_name: self.config.title.clone(),
+                initial_extent: extent,
+                ..VulkanRendererConfig::default()
+            },
+            window.as_ref(),
+            extent,
+        )?;
+        let runtime = EngineRuntime::with_renderer(self.config.runtime.clone(), renderer);
+        self.window_id = Some(window.id());
+        window.request_redraw();
+        self.runtime = Some(runtime);
+        self.window = Some(window);
+        Ok(())
+    }
+}
+
+impl ApplicationHandler for WindowedVulkanApp {
+    fn can_create_surfaces(&mut self, event_loop: &dyn ActiveEventLoop) {
+        if let Err(error) = self.initialize(event_loop) {
+            eprintln!("failed to initialize Vulkan app: {error}");
+            event_loop.exit();
+        }
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &dyn ActiveEventLoop,
+        window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        if Some(window_id) != self.window_id {
+            return;
+        }
+
+        match event {
+            WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::SurfaceResized(size) => {
+                if let Some(runtime) = &mut self.runtime {
+                    runtime.renderer_mut().resize(size.width, size.height);
+                }
+            }
+            WindowEvent::RedrawRequested => {
+                if let Some(runtime) = &mut self.runtime {
+                    if let Err(error) = runtime.tick() {
+                        eprintln!("runtime tick failed: {error}");
+                        event_loop.exit();
+                        return;
+                    }
+                }
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 #[cfg(test)]

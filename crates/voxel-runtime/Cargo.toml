@@ -14,5 +14,6 @@ tracing-subscriber.workspace = true
 voxel-core.workspace = true
 voxel-mesh.workspace = true
 voxel-render.workspace = true
+voxel-vulkan.workspace = true
 voxel-world.workspace = true
 winit.workspace = true

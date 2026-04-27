@@ -6,9 +6,16 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+ash-window.workspace = true
 ash.workspace = true
+bytemuck.workspace = true
+glam.workspace = true
 raw-window-handle.workspace = true
 thiserror.workspace = true
 vk-mem.workspace = true
+voxel-core.workspace = true
 voxel-mesh.workspace = true
 voxel-render.workspace = true
+
+[build-dependencies]
+shaderc.workspace = true
