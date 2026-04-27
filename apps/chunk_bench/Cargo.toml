@@ -1,0 +1,11 @@
+[package]
+name = "chunk_bench"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+voxel-core.workspace = true
+voxel-mesh.workspace = true
+voxel-world.workspace = true

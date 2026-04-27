@@ -1,0 +1,38 @@
+[workspace]
+members = [
+    "crates/voxel-core",
+    "crates/voxel-world",
+    "crates/voxel-mesh",
+    "crates/voxel-render",
+    "crates/voxel-vulkan",
+    "crates/voxel-runtime",
+    "apps/sandbox",
+    "apps/chunk_bench",
+    "apps/shader_lab",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = "https://example.invalid/voxel-engine"
+
+[workspace.dependencies]
+ash = "0.38"
+bytemuck = { version = "1.25.0", features = ["derive"] }
+crossbeam-channel = "0.5.15"
+glam = "0.32.1"
+raw-window-handle = "0.6.2"
+serde = { version = "1.0.228", features = ["derive"] }
+thiserror = "2.0.18"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.20", features = ["fmt", "env-filter"] }
+vk-mem = "0.5.0"
+winit = "0.31.0-beta.2"
+
+voxel-core = { path = "crates/voxel-core" }
+voxel-world = { path = "crates/voxel-world" }
+voxel-mesh = { path = "crates/voxel-mesh" }
+voxel-render = { path = "crates/voxel-render" }
+voxel-vulkan = { path = "crates/voxel-vulkan" }
+voxel-runtime = { path = "crates/voxel-runtime" }

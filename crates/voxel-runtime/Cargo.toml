@@ -1,0 +1,18 @@
+[package]
+name = "voxel-runtime"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+crossbeam-channel.workspace = true
+glam.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+voxel-core.workspace = true
+voxel-mesh.workspace = true
+voxel-render.workspace = true
+voxel-world.workspace = true
+winit.workspace = true
