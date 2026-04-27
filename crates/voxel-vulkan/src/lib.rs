@@ -285,6 +285,7 @@ pub struct VulkanRenderer {
     overlay_pipeline_layout: vk::PipelineLayout,
     overlay_pipeline: vk::Pipeline,
     meshes: HashMap<MeshHandle, GpuChunkMesh>,
+    retired_meshes: Vec<Vec<GpuChunkMesh>>,
     next_mesh_handle: u64,
     initialized: bool,
     swapchain_dirty: bool,
@@ -318,6 +319,7 @@ impl VulkanRenderer {
             overlay_pipeline_layout: vk::PipelineLayout::null(),
             overlay_pipeline: vk::Pipeline::null(),
             meshes: HashMap::new(),
+            retired_meshes: (0..MAX_FRAMES_IN_FLIGHT).map(|_| Vec::new()).collect(),
             next_mesh_handle: 0,
             initialized: false,
             swapchain_dirty: false,
@@ -992,6 +994,18 @@ impl VulkanRenderer {
         }
     }
 
+    fn retire_mesh(&mut self, mesh: GpuChunkMesh) {
+        let retire_frame = (self.current_frame + 1) % MAX_FRAMES_IN_FLIGHT;
+        self.retired_meshes[retire_frame].push(mesh);
+    }
+
+    fn destroy_retired_meshes(&mut self, frame_index: usize) {
+        let meshes = std::mem::take(&mut self.retired_meshes[frame_index]);
+        for mesh in meshes {
+            self.destroy_mesh(mesh);
+        }
+    }
+
     fn destroy_overlay_mesh(&self, overlay: OverlayMesh) {
         self.destroy_buffer(overlay.vertex);
         self.destroy_buffer(overlay.index);
@@ -1249,7 +1263,7 @@ impl RendererBackend for VulkanRenderer {
 
     fn remove_chunk_mesh(&mut self, handle: MeshHandle) {
         if let Some(mesh) = self.meshes.remove(&handle) {
-            self.destroy_mesh(mesh);
+            self.retire_mesh(mesh);
         }
     }
 
@@ -1274,6 +1288,7 @@ impl RendererBackend for VulkanRenderer {
                 .wait_for_fences(&[in_flight], true, u64::MAX)
                 .map_err(VulkanError::Vk)?;
         }
+        self.destroy_retired_meshes(frame_index);
 
         let extent = self
             .swapchain
@@ -1381,6 +1396,22 @@ impl Drop for VulkanRenderer {
                     if let Some(allocator) = &self.allocator {
                         let mut allocation = index.allocation;
                         allocator.destroy_buffer(index.buffer, &mut allocation);
+                    }
+                }
+            }
+            for meshes in self.retired_meshes.drain(..) {
+                for mesh in meshes {
+                    if let Some(vertex) = mesh.vertex {
+                        if let Some(allocator) = &self.allocator {
+                            let mut allocation = vertex.allocation;
+                            allocator.destroy_buffer(vertex.buffer, &mut allocation);
+                        }
+                    }
+                    if let Some(index) = mesh.index {
+                        if let Some(allocator) = &self.allocator {
+                            let mut allocation = index.allocation;
+                            allocator.destroy_buffer(index.buffer, &mut allocation);
+                        }
                     }
                 }
             }

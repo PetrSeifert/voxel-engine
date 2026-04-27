@@ -149,6 +149,12 @@ impl RenderScene {
         self.stats.resident_chunks = self.chunk_meshes.len();
         Ok(())
     }
+
+    pub fn remove_chunk_mesh(&mut self, coord: ChunkCoord) -> Option<ResidentChunkMesh> {
+        let removed = self.chunk_meshes.remove(&coord);
+        self.stats.resident_chunks = self.chunk_meshes.len();
+        removed
+    }
 }
 
 pub trait RendererBackend {

@@ -311,6 +311,10 @@ impl ChunkStore {
         self.chunks.insert(chunk.coord(), chunk);
     }
 
+    pub fn remove(&mut self, coord: ChunkCoord) -> Option<Chunk> {
+        self.chunks.remove(&coord)
+    }
+
     pub fn get(&self, coord: ChunkCoord) -> Option<&Chunk> {
         self.chunks.get(&coord)
     }
@@ -359,6 +363,10 @@ impl<G: WorldGenerator, E: EditLogStore> GeneratedWorld<G, E> {
 
     pub fn insert_chunk(&mut self, chunk: Chunk) {
         self.chunks.insert(chunk);
+    }
+
+    pub fn remove_chunk(&mut self, coord: ChunkCoord) -> Option<Chunk> {
+        self.chunks.remove(coord)
     }
 
     pub fn edit_block(&mut self, voxel: VoxelCoord, new_state: BlockState) {

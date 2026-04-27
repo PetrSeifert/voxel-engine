@@ -1,6 +1,6 @@
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
 use glam::{Vec2, Vec3};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use tracing::{debug, info};
@@ -49,8 +49,8 @@ impl Default for RuntimeConfig {
             .clamp(1, 4);
         Self {
             seed: 0x5eed,
-            horizontal_view_distance: 2,
-            vertical_view_distance: 1,
+            horizontal_view_distance: 16,
+            vertical_view_distance: 8,
             max_chunk_jobs_per_tick: 2,
             max_inflight_chunk_jobs: worker_threads * 2,
             max_mesh_uploads_per_tick: 1,
@@ -274,6 +274,11 @@ struct ChunkBuildResult {
     mesh_result: MeshJobResult,
 }
 
+struct ActiveChunkSet {
+    ordered: Vec<ChunkCoord>,
+    coords: HashSet<ChunkCoord>,
+}
+
 #[derive(Clone, Debug)]
 struct MeshJob {
     coord: ChunkCoord,
@@ -290,8 +295,7 @@ pub struct StreamingWorkers {
 impl StreamingWorkers {
     fn new(config: &RuntimeConfig, registry: BlockRegistry) -> Self {
         let worker_count = config.chunk_worker_threads.max(1);
-        let queue_capacity = config.max_inflight_chunk_jobs.max(worker_count);
-        let (job_tx, job_rx) = bounded(queue_capacity);
+        let (job_tx, job_rx) = bounded(0);
         let (result_tx, result_rx) = unbounded();
         let mut threads = Vec::with_capacity(worker_count);
 
@@ -367,7 +371,7 @@ pub struct EngineRuntime<R: RendererBackend = NullRenderer> {
     stream_planner: StreamPlanner,
     streaming_states: HashMap<ChunkCoord, ChunkStreamingState>,
     pending_uploads: VecDeque<MeshJobResult>,
-    inflight_mesh_jobs: usize,
+    inflight_mesh_jobs: HashSet<ChunkCoord>,
     workers: StreamingWorkers,
     renderer: R,
     scene: RenderScene,
@@ -399,7 +403,7 @@ impl<R: RendererBackend> EngineRuntime<R> {
             world,
             streaming_states: HashMap::new(),
             pending_uploads: VecDeque::new(),
-            inflight_mesh_jobs: 0,
+            inflight_mesh_jobs: HashSet::new(),
             workers,
             renderer,
             scene: RenderScene::default(),
@@ -453,8 +457,9 @@ impl<R: RendererBackend> EngineRuntime<R> {
         self.camera_controller
             .apply_input(&mut self.scene, camera_input, dt);
 
-        self.schedule_visible_chunks();
-        self.mesh_ready_chunks();
+        let active_chunks = self.schedule_visible_chunks();
+        self.evict_out_of_range_chunks(&active_chunks.coords);
+        self.mesh_ready_chunks(&active_chunks.ordered);
         self.collect_mesh_results();
         self.upload_pending_meshes()?;
         self.update_debug_overlay();
@@ -468,41 +473,64 @@ impl<R: RendererBackend> EngineRuntime<R> {
         VoxelCoord::new(pos.x, pos.y, pos.z).split_chunk_local().0
     }
 
-    fn schedule_visible_chunks(&mut self) {
+    fn schedule_visible_chunks(&mut self) -> ActiveChunkSet {
         let tickets = self.stream_planner.tickets_around(self.camera_chunk());
         self.scene.stats.mesh_queue_depth = tickets.len();
+        let mut ordered = Vec::with_capacity(tickets.len());
+        let mut coords = HashSet::with_capacity(tickets.len());
         for ticket in tickets {
+            ordered.push(ticket.coord);
+            coords.insert(ticket.coord);
             self.streaming_states
                 .entry(ticket.coord)
                 .or_insert(ChunkStreamingState::Missing);
         }
+        ActiveChunkSet { ordered, coords }
     }
 
-    fn mesh_ready_chunks(&mut self) {
+    fn evict_out_of_range_chunks(&mut self, active_chunks: &HashSet<ChunkCoord>) {
+        self.pending_uploads
+            .retain(|result| active_chunks.contains(&result.mesh.version.chunk));
+
+        let stale_coords: Vec<_> = self
+            .streaming_states
+            .keys()
+            .copied()
+            .filter(|coord| !active_chunks.contains(coord))
+            .collect();
+
+        for coord in stale_coords {
+            if let Some(resident) = self.scene.remove_chunk_mesh(coord) {
+                self.renderer.remove_chunk_mesh(resident.handle);
+            }
+            self.world.remove_chunk(coord);
+            self.streaming_states.remove(&coord);
+            self.inflight_mesh_jobs.remove(&coord);
+        }
+    }
+
+    fn mesh_ready_chunks(&mut self, ordered_chunks: &[ChunkCoord]) {
         let mut queued = 0;
         let capacity = self
             .config
             .max_inflight_chunk_jobs
-            .saturating_sub(self.inflight_mesh_jobs);
+            .saturating_sub(self.inflight_mesh_jobs.len());
         if capacity == 0 {
             return;
         }
 
-        let coords: Vec<_> = self
-            .streaming_states
-            .iter()
-            .filter_map(|(coord, state)| {
-                matches!(
-                    state,
-                    ChunkStreamingState::Missing | ChunkStreamingState::Generated
-                )
-                .then_some(*coord)
-            })
-            .collect();
-
-        for coord in coords {
+        for &coord in ordered_chunks {
             if queued >= self.config.max_chunk_jobs_per_tick || queued >= capacity {
                 break;
+            }
+            if !matches!(
+                self.streaming_states.get(&coord),
+                Some(ChunkStreamingState::Missing | ChunkStreamingState::Generated)
+            ) {
+                continue;
+            }
+            if self.inflight_mesh_jobs.contains(&coord) {
+                continue;
             }
 
             self.streaming_states
@@ -536,19 +564,20 @@ impl<R: RendererBackend> EngineRuntime<R> {
 
             self.streaming_states
                 .insert(coord, ChunkStreamingState::Meshing);
-            self.inflight_mesh_jobs += 1;
+            self.inflight_mesh_jobs.insert(coord);
             queued += 1;
         }
     }
 
     fn collect_mesh_results(&mut self) {
         while let Ok(result) = self.workers.result_rx.try_recv() {
-            self.inflight_mesh_jobs = self.inflight_mesh_jobs.saturating_sub(1);
             let coord = result.mesh_result.mesh.version.chunk;
+            let was_inflight = self.inflight_mesh_jobs.remove(&coord);
             if !matches!(
                 self.streaming_states.get(&coord),
                 Some(ChunkStreamingState::Meshing)
-            ) {
+            ) || !was_inflight
+            {
                 continue;
             }
 
@@ -593,7 +622,7 @@ impl<R: RendererBackend> EngineRuntime<R> {
         };
         let resident_chunks = self.scene.chunk_meshes.len();
         let visible_chunks = resident_chunks;
-        let mesh_queue_depth = self.inflight_mesh_jobs + self.pending_uploads.len();
+        let mesh_queue_depth = self.inflight_mesh_jobs.len() + self.pending_uploads.len();
         let upload_kib = self.scene.stats.upload_bytes as f32 / 1024.0;
         self.scene.stats.mesh_queue_depth = mesh_queue_depth;
 
@@ -848,6 +877,124 @@ mod tests {
         let stats = tick_until_resident(&mut runtime, 1);
         assert_eq!(stats.resident_chunks, 1);
         assert!(!runtime.scene().debug_draws.is_empty());
+    }
+
+    #[test]
+    fn runtime_schedules_nearest_chunk_first() {
+        let mut runtime = EngineRuntime::new_headless(RuntimeConfig {
+            horizontal_view_distance: 1,
+            vertical_view_distance: 1,
+            max_chunk_jobs_per_tick: 1,
+            max_inflight_chunk_jobs: 1,
+            max_mesh_uploads_per_tick: 1,
+            ..RuntimeConfig::default()
+        });
+
+        let camera_chunk = runtime.camera_chunk();
+        for _ in 0..100 {
+            runtime.tick().unwrap();
+            if matches!(
+                runtime.streaming_states.get(&camera_chunk),
+                Some(
+                    ChunkStreamingState::Meshing
+                        | ChunkStreamingState::UploadQueued
+                        | ChunkStreamingState::Resident
+                )
+            ) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(matches!(
+            runtime.streaming_states.get(&camera_chunk),
+            Some(
+                ChunkStreamingState::Meshing
+                    | ChunkStreamingState::UploadQueued
+                    | ChunkStreamingState::Resident
+            )
+        ));
+    }
+
+    #[test]
+    fn runtime_reprioritizes_after_camera_moves() {
+        let mut runtime = EngineRuntime::new_headless(RuntimeConfig {
+            horizontal_view_distance: 0,
+            vertical_view_distance: 0,
+            max_chunk_jobs_per_tick: 1,
+            max_inflight_chunk_jobs: 1,
+            max_mesh_uploads_per_tick: 1,
+            chunk_worker_threads: 1,
+            ..RuntimeConfig::default()
+        });
+
+        let stale_chunk = runtime.camera_chunk();
+        runtime
+            .streaming_states
+            .insert(stale_chunk, ChunkStreamingState::Meshing);
+        runtime.inflight_mesh_jobs.insert(stale_chunk);
+
+        let next_chunk = stale_chunk.offset(2, 0, 0);
+        let next_origin = next_chunk.min_voxel();
+        runtime.scene.camera.position = Vec3::new(
+            next_origin.x as f32 + 1.0,
+            next_origin.y as f32 + 1.0,
+            next_origin.z as f32 + 1.0,
+        );
+
+        let active_chunks = runtime.schedule_visible_chunks();
+        runtime.evict_out_of_range_chunks(&active_chunks.coords);
+        for _ in 0..100 {
+            runtime.mesh_ready_chunks(&active_chunks.ordered);
+            if matches!(
+                runtime.streaming_states.get(&next_chunk),
+                Some(ChunkStreamingState::Meshing)
+            ) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(!runtime.inflight_mesh_jobs.contains(&stale_chunk));
+        assert!(!runtime.streaming_states.contains_key(&stale_chunk));
+        assert!(matches!(
+            runtime.streaming_states.get(&next_chunk),
+            Some(ChunkStreamingState::Meshing)
+        ));
+        assert!(runtime.inflight_mesh_jobs.contains(&next_chunk));
+    }
+
+    #[test]
+    fn runtime_unloads_chunks_outside_view_distance() {
+        let mut runtime = EngineRuntime::new_headless(RuntimeConfig {
+            horizontal_view_distance: 0,
+            vertical_view_distance: 0,
+            max_chunk_jobs_per_tick: 1,
+            max_mesh_uploads_per_tick: 1,
+            ..RuntimeConfig::default()
+        });
+
+        let initial_chunk = runtime.camera_chunk();
+        tick_until_resident(&mut runtime, 1);
+        assert!(runtime.scene().chunk_meshes.contains_key(&initial_chunk));
+        assert!(runtime.world.chunks().get(initial_chunk).is_some());
+
+        let next_chunk = initial_chunk.offset(2, 0, 0);
+        let next_origin = next_chunk.min_voxel();
+        runtime.scene.camera.position = Vec3::new(
+            next_origin.x as f32 + 1.0,
+            next_origin.y as f32 + 1.0,
+            next_origin.z as f32 + 1.0,
+        );
+
+        tick_until_resident(&mut runtime, 1);
+
+        assert!(!runtime.scene().chunk_meshes.contains_key(&initial_chunk));
+        assert!(runtime.scene().chunk_meshes.contains_key(&next_chunk));
+        assert!(runtime.world.chunks().get(initial_chunk).is_none());
+        assert!(runtime.world.chunks().get(next_chunk).is_some());
+        assert_eq!(runtime.scene().chunk_meshes.len(), 1);
+        assert_eq!(runtime.world.chunks().len(), 1);
     }
 
     #[test]
