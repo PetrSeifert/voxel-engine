@@ -81,6 +81,7 @@ impl Default for MaterialAtlas {
 #[derive(Clone, Debug, Default)]
 pub struct FrameStats {
     pub frame_index: u64,
+    pub frame_time_ms: f32,
     pub visible_chunks: usize,
     pub resident_chunks: usize,
     pub mesh_queue_depth: usize,

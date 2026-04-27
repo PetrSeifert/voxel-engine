@@ -8,6 +8,8 @@ fn main() {
     let shaders = [
         ("chunk.vert", shaderc::ShaderKind::Vertex),
         ("chunk.frag", shaderc::ShaderKind::Fragment),
+        ("overlay.vert", shaderc::ShaderKind::Vertex),
+        ("overlay.frag", shaderc::ShaderKind::Fragment),
     ];
 
     let compiler = shaderc::Compiler::new().expect("create shaderc compiler");

@@ -5,7 +5,9 @@ use std::time::{Duration, Instant};
 use tracing::{debug, info};
 use voxel_core::{BlockState, CHUNK_SIZE, ChunkCoord, VoxelCoord};
 use voxel_mesh::{ChunkMesh, mesh_chunk_greedy};
-use voxel_render::{FrameStats, NullRenderer, RenderError, RenderScene, RendererBackend};
+use voxel_render::{
+    DebugDraw, FrameStats, NullRenderer, RenderError, RenderScene, RendererBackend,
+};
 use voxel_vulkan::{VulkanRenderer, VulkanRendererConfig};
 use voxel_world::{
     BlockRegistry, ChunkProvider, ChunkStreamingState, GeneratedWorld, InMemoryEditLogStore,
@@ -31,6 +33,7 @@ pub struct RuntimeConfig {
     pub horizontal_view_distance: i32,
     pub vertical_view_distance: i32,
     pub max_chunk_jobs_per_tick: usize,
+    pub debug_overlay: bool,
 }
 
 impl Default for RuntimeConfig {
@@ -40,6 +43,7 @@ impl Default for RuntimeConfig {
             horizontal_view_distance: 2,
             vertical_view_distance: 1,
             max_chunk_jobs_per_tick: 8,
+            debug_overlay: true,
         }
     }
 }
@@ -322,6 +326,17 @@ impl<R: RendererBackend> EngineRuntime<R> {
         &mut self.renderer
     }
 
+    pub fn set_debug_overlay_enabled(&mut self, enabled: bool) {
+        self.config.debug_overlay = enabled;
+        if !enabled {
+            self.scene.debug_draws.clear();
+        }
+    }
+
+    pub fn debug_overlay_enabled(&self) -> bool {
+        self.config.debug_overlay
+    }
+
     pub fn edit_block(&mut self, voxel: VoxelCoord, state: BlockState) {
         self.world.edit_block(voxel, state);
         let (coord, _) = voxel.split_chunk_local();
@@ -340,6 +355,7 @@ impl<R: RendererBackend> EngineRuntime<R> {
         let now = Instant::now();
         let dt = now.saturating_duration_since(self.last_tick);
         self.last_tick = now;
+        self.scene.stats.frame_time_ms = dt.as_secs_f32() * 1000.0;
         self.camera_controller
             .apply_input(&mut self.scene, camera_input, dt);
 
@@ -347,6 +363,7 @@ impl<R: RendererBackend> EngineRuntime<R> {
         self.mesh_ready_chunks();
         self.collect_mesh_results();
         self.upload_pending_meshes()?;
+        self.update_debug_overlay();
         let stats = self.renderer.render_frame(&self.scene)?;
         self.scene.stats = stats.clone();
         Ok(stats)
@@ -428,6 +445,56 @@ impl<R: RendererBackend> EngineRuntime<R> {
         }
         self.scene.stats.upload_bytes = upload_bytes;
         Ok(())
+    }
+
+    fn update_debug_overlay(&mut self) {
+        self.scene.debug_draws.clear();
+        if !self.config.debug_overlay {
+            return;
+        }
+
+        let camera = &self.scene.camera;
+        let camera_chunk = self.camera_chunk();
+        let frame_ms = self.scene.stats.frame_time_ms;
+        let fps = if frame_ms > 0.0 {
+            1000.0 / frame_ms
+        } else {
+            0.0
+        };
+        let resident_chunks = self.scene.chunk_meshes.len();
+        let visible_chunks = resident_chunks;
+        let mesh_queue_depth = self.scene.stats.mesh_queue_depth;
+        let upload_kib = self.scene.stats.upload_bytes as f32 / 1024.0;
+
+        self.scene.debug_draws.extend([
+            DebugDraw::TextLine {
+                label: "frame".to_owned(),
+                value: format!("{frame_ms:.2} ms  {fps:.0} fps"),
+            },
+            DebugDraw::TextLine {
+                label: "chunks".to_owned(),
+                value: format!("visible {visible_chunks}  resident {resident_chunks}"),
+            },
+            DebugDraw::TextLine {
+                label: "queues".to_owned(),
+                value: format!("mesh {mesh_queue_depth}  upload {upload_kib:.1} KiB"),
+            },
+            DebugDraw::TextLine {
+                label: "camera".to_owned(),
+                value: format!(
+                    "{:.1}, {:.1}, {:.1}",
+                    camera.position.x, camera.position.y, camera.position.z
+                ),
+            },
+            DebugDraw::TextLine {
+                label: "chunk".to_owned(),
+                value: format!("{}, {}, {}", camera_chunk.x, camera_chunk.y, camera_chunk.z),
+            },
+            DebugDraw::TextLine {
+                label: "controls".to_owned(),
+                value: "LMB lock  Esc release  F3 hud".to_owned(),
+            },
+        ]);
     }
 }
 
@@ -560,6 +627,10 @@ impl ApplicationHandler for WindowedVulkanApp {
                 if let PhysicalKey::Code(key) = event.physical_key {
                     if key == KeyCode::Escape && event.state == ElementState::Pressed {
                         self.set_pointer_locked(false);
+                    } else if key == KeyCode::F3 && event.state == ElementState::Pressed {
+                        if let Some(runtime) = &mut self.runtime {
+                            runtime.set_debug_overlay_enabled(!runtime.debug_overlay_enabled());
+                        }
                     } else {
                         self.camera_input.handle_key(key, event.state);
                     }
@@ -630,6 +701,7 @@ mod tests {
         });
         let stats = runtime.tick().unwrap();
         assert_eq!(stats.resident_chunks, 1);
+        assert!(!runtime.scene().debug_draws.is_empty());
     }
 
     #[test]
@@ -663,5 +735,21 @@ mod tests {
         assert_eq!(frame.look_delta, Vec2::new(10.0, -5.0));
         assert!(frame.boost);
         assert_eq!(input.frame_input().look_delta, Vec2::ZERO);
+    }
+
+    #[test]
+    fn debug_overlay_can_be_disabled() {
+        let mut runtime = EngineRuntime::new_headless(RuntimeConfig {
+            horizontal_view_distance: 0,
+            vertical_view_distance: 0,
+            max_chunk_jobs_per_tick: 1,
+            debug_overlay: false,
+            ..RuntimeConfig::default()
+        });
+        runtime.tick().unwrap();
+        assert!(runtime.scene().debug_draws.is_empty());
+        runtime.set_debug_overlay_enabled(true);
+        runtime.tick().unwrap();
+        assert!(!runtime.scene().debug_draws.is_empty());
     }
 }

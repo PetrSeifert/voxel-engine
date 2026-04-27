@@ -18,7 +18,7 @@ use vk_mem::{
 };
 use voxel_core::{CHUNK_SIZE, ChunkCoord};
 use voxel_mesh::{ChunkMesh, MeshVertex};
-use voxel_render::{FrameStats, MeshHandle, RenderError, RenderScene, RendererBackend};
+use voxel_render::{DebugDraw, FrameStats, MeshHandle, RenderError, RenderScene, RendererBackend};
 
 pub const REQUIRED_API_VERSION: u32 = vk::API_VERSION_1_3;
 const MAX_FRAMES_IN_FLIGHT: usize = 2;
@@ -27,6 +27,8 @@ const VALIDATION_LAYER: &CStr = c"VK_LAYER_KHRONOS_validation";
 
 const CHUNK_VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/chunk.vert.spv"));
 const CHUNK_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/chunk.frag.spv"));
+const OVERLAY_VERT_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/overlay.vert.spv"));
+const OVERLAY_FRAG_SPV: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/overlay.frag.spv"));
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct VulkanFeaturePolicy {
@@ -219,12 +221,19 @@ struct GpuChunkMesh {
     chunk_coord: ChunkCoord,
 }
 
+struct OverlayMesh {
+    vertex: GpuBuffer,
+    index: GpuBuffer,
+    index_count: u32,
+}
+
 struct FrameResources {
     command_pool: vk::CommandPool,
     command_buffer: vk::CommandBuffer,
     image_available: vk::Semaphore,
     render_finished: vk::Semaphore,
     in_flight: vk::Fence,
+    overlay: Option<OverlayMesh>,
 }
 
 struct SwapchainState {
@@ -243,6 +252,13 @@ struct SwapchainState {
 struct PushConstants {
     view_proj: [[f32; 4]; 4],
     chunk_origin: [f32; 4],
+}
+
+#[derive(Clone, Copy, Pod, Zeroable)]
+#[repr(C)]
+struct OverlayVertex {
+    position: [f32; 2],
+    color: [f32; 4],
 }
 
 pub struct VulkanRenderer {
@@ -266,6 +282,8 @@ pub struct VulkanRenderer {
     swapchain: Option<SwapchainState>,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+    overlay_pipeline_layout: vk::PipelineLayout,
+    overlay_pipeline: vk::Pipeline,
     meshes: HashMap<MeshHandle, GpuChunkMesh>,
     next_mesh_handle: u64,
     initialized: bool,
@@ -297,6 +315,8 @@ impl VulkanRenderer {
             swapchain: None,
             pipeline_layout: vk::PipelineLayout::null(),
             pipeline: vk::Pipeline::null(),
+            overlay_pipeline_layout: vk::PipelineLayout::null(),
+            overlay_pipeline: vk::Pipeline::null(),
             meshes: HashMap::new(),
             next_mesh_handle: 0,
             initialized: false,
@@ -571,6 +591,15 @@ impl VulkanRenderer {
                     .destroy_pipeline_layout(self.pipeline_layout, None);
                 self.pipeline_layout = vk::PipelineLayout::null();
             }
+            if self.overlay_pipeline != vk::Pipeline::null() {
+                self.device()?.destroy_pipeline(self.overlay_pipeline, None);
+                self.overlay_pipeline = vk::Pipeline::null();
+            }
+            if self.overlay_pipeline_layout != vk::PipelineLayout::null() {
+                self.device()?
+                    .destroy_pipeline_layout(self.overlay_pipeline_layout, None);
+                self.overlay_pipeline_layout = vk::PipelineLayout::null();
+            }
         }
 
         let device = self.device()?;
@@ -694,7 +723,116 @@ impl VulkanRenderer {
         }
         self.pipeline_layout = pipeline_layout;
         self.pipeline = pipeline;
+        let (overlay_pipeline_layout, overlay_pipeline) =
+            self.create_overlay_pipeline(color_format)?;
+        self.overlay_pipeline_layout = overlay_pipeline_layout;
+        self.overlay_pipeline = overlay_pipeline;
         Ok(())
+    }
+
+    fn create_overlay_pipeline(
+        &self,
+        color_format: vk::Format,
+    ) -> Result<(vk::PipelineLayout, vk::Pipeline), VulkanError> {
+        let device = self.device()?;
+        let vert_shader = create_shader_module(device, OVERLAY_VERT_SPV)?;
+        let frag_shader = create_shader_module(device, OVERLAY_FRAG_SPV)?;
+        let main = c"main";
+        let shader_stages = [
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::VERTEX)
+                .module(vert_shader)
+                .name(main),
+            vk::PipelineShaderStageCreateInfo::default()
+                .stage(vk::ShaderStageFlags::FRAGMENT)
+                .module(frag_shader)
+                .name(main),
+        ];
+
+        let binding = vk::VertexInputBindingDescription {
+            binding: 0,
+            stride: std::mem::size_of::<OverlayVertex>() as u32,
+            input_rate: vk::VertexInputRate::VERTEX,
+        };
+        let attributes = [
+            vk::VertexInputAttributeDescription {
+                location: 0,
+                binding: 0,
+                format: vk::Format::R32G32_SFLOAT,
+                offset: 0,
+            },
+            vk::VertexInputAttributeDescription {
+                location: 1,
+                binding: 0,
+                format: vk::Format::R32G32B32A32_SFLOAT,
+                offset: 8,
+            },
+        ];
+        let vertex_input = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(std::slice::from_ref(&binding))
+            .vertex_attribute_descriptions(&attributes);
+        let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
+            .topology(vk::PrimitiveTopology::TRIANGLE_LIST);
+        let viewport_state = vk::PipelineViewportStateCreateInfo::default()
+            .viewport_count(1)
+            .scissor_count(1);
+        let rasterizer = vk::PipelineRasterizationStateCreateInfo::default()
+            .polygon_mode(vk::PolygonMode::FILL)
+            .cull_mode(vk::CullModeFlags::NONE)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
+            .line_width(1.0);
+        let multisample = vk::PipelineMultisampleStateCreateInfo::default()
+            .rasterization_samples(vk::SampleCountFlags::TYPE_1);
+        let depth = vk::PipelineDepthStencilStateCreateInfo::default()
+            .depth_test_enable(false)
+            .depth_write_enable(false);
+        let color_blend_attachment = vk::PipelineColorBlendAttachmentState::default()
+            .color_write_mask(
+                vk::ColorComponentFlags::R
+                    | vk::ColorComponentFlags::G
+                    | vk::ColorComponentFlags::B
+                    | vk::ColorComponentFlags::A,
+            )
+            .blend_enable(true)
+            .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+            .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .color_blend_op(vk::BlendOp::ADD)
+            .src_alpha_blend_factor(vk::BlendFactor::ONE)
+            .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+            .alpha_blend_op(vk::BlendOp::ADD);
+        let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
+            .attachments(std::slice::from_ref(&color_blend_attachment));
+        let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
+        let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
+        let layout_info = vk::PipelineLayoutCreateInfo::default();
+        let pipeline_layout = unsafe { device.create_pipeline_layout(&layout_info, None)? };
+
+        let color_formats = [color_format];
+        let mut rendering = vk::PipelineRenderingCreateInfo::default()
+            .color_attachment_formats(&color_formats)
+            .depth_attachment_format(DEPTH_FORMAT);
+        let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+            .push_next(&mut rendering)
+            .stages(&shader_stages)
+            .vertex_input_state(&vertex_input)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&rasterizer)
+            .multisample_state(&multisample)
+            .depth_stencil_state(&depth)
+            .color_blend_state(&color_blend)
+            .dynamic_state(&dynamic)
+            .layout(pipeline_layout);
+        let pipeline = unsafe {
+            device
+                .create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+                .map_err(|(_, err)| err)?[0]
+        };
+        unsafe {
+            device.destroy_shader_module(vert_shader, None);
+            device.destroy_shader_module(frag_shader, None);
+        }
+        Ok((pipeline_layout, pipeline))
     }
 
     fn create_buffer(
@@ -753,6 +891,58 @@ impl VulkanRenderer {
         Ok(device_buffer)
     }
 
+    fn create_host_buffer_from_bytes(
+        &self,
+        bytes: &[u8],
+        usage: vk::BufferUsageFlags,
+    ) -> Result<GpuBuffer, VulkanError> {
+        let size = bytes.len().max(1) as vk::DeviceSize;
+        let mut buffer = self.create_buffer(
+            size,
+            usage,
+            MemoryUsage::AutoPreferHost,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            AllocationCreateFlags::HOST_ACCESS_SEQUENTIAL_WRITE,
+        )?;
+        unsafe {
+            let data = self.allocator()?.map_memory(&mut buffer.allocation)?;
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), data, bytes.len());
+            self.allocator()?.unmap_memory(&mut buffer.allocation);
+        }
+        Ok(buffer)
+    }
+
+    fn prepare_overlay_mesh(
+        &mut self,
+        frame_index: usize,
+        scene: &RenderScene,
+        extent: vk::Extent2D,
+    ) -> Result<(), VulkanError> {
+        if let Some(overlay) = self.frames[frame_index].overlay.take() {
+            self.destroy_overlay_mesh(overlay);
+        }
+
+        let (vertices, indices) = build_debug_overlay(scene, extent);
+        if vertices.is_empty() || indices.is_empty() {
+            return Ok(());
+        }
+
+        let vertex = self.create_host_buffer_from_bytes(
+            bytemuck::cast_slice(&vertices),
+            vk::BufferUsageFlags::VERTEX_BUFFER,
+        )?;
+        let index = self.create_host_buffer_from_bytes(
+            bytemuck::cast_slice(&indices),
+            vk::BufferUsageFlags::INDEX_BUFFER,
+        )?;
+        self.frames[frame_index].overlay = Some(OverlayMesh {
+            vertex,
+            index,
+            index_count: indices.len() as u32,
+        });
+        Ok(())
+    }
+
     fn copy_buffer(
         &self,
         src: vk::Buffer,
@@ -802,13 +992,26 @@ impl VulkanRenderer {
         }
     }
 
+    fn destroy_overlay_mesh(&self, overlay: OverlayMesh) {
+        self.destroy_buffer(overlay.vertex);
+        self.destroy_buffer(overlay.index);
+    }
+
     fn record_command_buffer(
         &mut self,
+        frame_index: usize,
         command_buffer: vk::CommandBuffer,
         image_index: usize,
         scene: &RenderScene,
     ) -> Result<(), VulkanError> {
         let device = self.device()?.clone();
+        let overlay_draw = self.frames[frame_index].overlay.as_ref().map(|overlay| {
+            (
+                overlay.vertex.buffer,
+                overlay.index.buffer,
+                overlay.index_count,
+            )
+        });
         let swapchain = self
             .swapchain
             .as_mut()
@@ -927,6 +1130,22 @@ impl VulkanRenderer {
                 );
                 device.cmd_draw_indexed(command_buffer, mesh.index_count, 1, 0, 0, 0);
             }
+
+            if let Some((vertex_buffer, index_buffer, index_count)) = overlay_draw {
+                device.cmd_bind_pipeline(
+                    command_buffer,
+                    vk::PipelineBindPoint::GRAPHICS,
+                    self.overlay_pipeline,
+                );
+                device.cmd_bind_vertex_buffers(command_buffer, 0, &[vertex_buffer], &[0]);
+                device.cmd_bind_index_buffer(
+                    command_buffer,
+                    index_buffer,
+                    0,
+                    vk::IndexType::UINT32,
+                );
+                device.cmd_draw_indexed(command_buffer, index_count, 1, 0, 0, 0);
+            }
             device.cmd_end_rendering(command_buffer);
 
             transition_image(
@@ -969,6 +1188,18 @@ impl VulkanRenderer {
                     .unwrap()
                     .destroy_pipeline_layout(self.pipeline_layout, None);
                 self.pipeline_layout = vk::PipelineLayout::null();
+            }
+            if self.overlay_pipeline != vk::Pipeline::null() {
+                self.device()
+                    .unwrap()
+                    .destroy_pipeline(self.overlay_pipeline, None);
+                self.overlay_pipeline = vk::Pipeline::null();
+            }
+            if self.overlay_pipeline_layout != vk::PipelineLayout::null() {
+                self.device()
+                    .unwrap()
+                    .destroy_pipeline_layout(self.overlay_pipeline_layout, None);
+                self.overlay_pipeline_layout = vk::PipelineLayout::null();
             }
         }
     }
@@ -1044,6 +1275,13 @@ impl RendererBackend for VulkanRenderer {
                 .map_err(VulkanError::Vk)?;
         }
 
+        let extent = self
+            .swapchain
+            .as_ref()
+            .ok_or(VulkanError::NotInitialized("swapchain"))?
+            .extent;
+        self.prepare_overlay_mesh(frame_index, scene, extent)?;
+
         let swapchain = self
             .swapchain
             .as_ref()
@@ -1070,7 +1308,7 @@ impl RendererBackend for VulkanRenderer {
                 .reset_fences(&[in_flight])
                 .map_err(VulkanError::Vk)?;
         }
-        self.record_command_buffer(command_buffer, image_index as usize, scene)?;
+        self.record_command_buffer(frame_index, command_buffer, image_index as usize, scene)?;
 
         let wait_semaphores = [image_available];
         let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
@@ -1149,7 +1387,14 @@ impl Drop for VulkanRenderer {
             self.destroy_swapchain_resources();
 
             if let Some(device) = &self.device {
-                for frame in self.frames.drain(..) {
+                let allocator = self.allocator.clone();
+                for mut frame in self.frames.drain(..) {
+                    if let (Some(overlay), Some(allocator)) = (frame.overlay.take(), &allocator) {
+                        let mut vertex_allocation = overlay.vertex.allocation;
+                        allocator.destroy_buffer(overlay.vertex.buffer, &mut vertex_allocation);
+                        let mut index_allocation = overlay.index.allocation;
+                        allocator.destroy_buffer(overlay.index.buffer, &mut index_allocation);
+                    }
                     device.destroy_fence(frame.in_flight, None);
                     device.destroy_semaphore(frame.render_finished, None);
                     device.destroy_semaphore(frame.image_available, None);
@@ -1441,6 +1686,7 @@ fn create_frame_resources(
                 image_available: unsafe { device.create_semaphore(&semaphore_info, None)? },
                 render_finished: unsafe { device.create_semaphore(&semaphore_info, None)? },
                 in_flight: unsafe { device.create_fence(&fence_info, None)? },
+                overlay: None,
             })
         })
         .collect()
@@ -1560,6 +1806,284 @@ fn chunk_origin(coord: ChunkCoord) -> [f32; 3] {
     ]
 }
 
+fn build_debug_overlay(
+    scene: &RenderScene,
+    extent: vk::Extent2D,
+) -> (Vec<OverlayVertex>, Vec<u32>) {
+    if scene.debug_draws.is_empty() || extent.width == 0 || extent.height == 0 {
+        return (Vec::new(), Vec::new());
+    }
+
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    let scale = 3.0;
+    let margin = 12.0;
+    let padding = 7.0;
+    let line_height = 9.0 * scale;
+    let glyph_advance = 6.0 * scale;
+    let text_color = [0.86, 0.93, 1.0, 0.96];
+    let panel_color = [0.015, 0.02, 0.028, 0.72];
+
+    let mut y = margin;
+    for line in scene.debug_draws.iter().filter_map(debug_draw_text) {
+        let text = line.to_ascii_uppercase();
+        let visible_len = text.chars().take(96).count() as f32;
+        let panel_width = visible_len * glyph_advance + padding * 2.0;
+        add_overlay_rect(
+            &mut vertices,
+            &mut indices,
+            extent,
+            [margin - padding, y - padding * 0.5],
+            [panel_width, line_height + padding],
+            panel_color,
+        );
+        add_overlay_text(
+            &mut vertices,
+            &mut indices,
+            extent,
+            [margin, y],
+            scale,
+            &text,
+            text_color,
+        );
+        y += line_height + padding + 2.0;
+        if y > extent.height as f32 - line_height {
+            break;
+        }
+    }
+
+    (vertices, indices)
+}
+
+fn debug_draw_text(draw: &DebugDraw) -> Option<String> {
+    match draw {
+        DebugDraw::TextLine { label, value } => Some(format!("{label}: {value}")),
+        DebugDraw::ChunkBounds { .. } => None,
+    }
+}
+
+fn add_overlay_text(
+    vertices: &mut Vec<OverlayVertex>,
+    indices: &mut Vec<u32>,
+    extent: vk::Extent2D,
+    origin: [f32; 2],
+    scale: f32,
+    text: &str,
+    color: [f32; 4],
+) {
+    let mut x = origin[0];
+    for ch in text.chars().take(96) {
+        if ch == ' ' {
+            x += 6.0 * scale;
+            continue;
+        }
+        let glyph = glyph_rows(ch);
+        for (row, bits) in glyph.iter().enumerate() {
+            for col in 0..5 {
+                let mask = 1 << (4 - col);
+                if bits & mask != 0 {
+                    add_overlay_rect(
+                        vertices,
+                        indices,
+                        extent,
+                        [x + col as f32 * scale, origin[1] + row as f32 * scale],
+                        [scale, scale],
+                        color,
+                    );
+                }
+            }
+        }
+        x += 6.0 * scale;
+    }
+}
+
+fn add_overlay_rect(
+    vertices: &mut Vec<OverlayVertex>,
+    indices: &mut Vec<u32>,
+    extent: vk::Extent2D,
+    origin: [f32; 2],
+    size: [f32; 2],
+    color: [f32; 4],
+) {
+    let x0 = origin[0];
+    let y0 = origin[1];
+    let x1 = origin[0] + size[0];
+    let y1 = origin[1] + size[1];
+    let base = vertices.len() as u32;
+    vertices.extend([
+        OverlayVertex {
+            position: pixel_to_ndc(x0, y0, extent),
+            color,
+        },
+        OverlayVertex {
+            position: pixel_to_ndc(x1, y0, extent),
+            color,
+        },
+        OverlayVertex {
+            position: pixel_to_ndc(x1, y1, extent),
+            color,
+        },
+        OverlayVertex {
+            position: pixel_to_ndc(x0, y1, extent),
+            color,
+        },
+    ]);
+    indices.extend([base, base + 1, base + 2, base, base + 2, base + 3]);
+}
+
+fn pixel_to_ndc(x: f32, y: f32, extent: vk::Extent2D) -> [f32; 2] {
+    [
+        x / extent.width.max(1) as f32 * 2.0 - 1.0,
+        y / extent.height.max(1) as f32 * 2.0 - 1.0,
+    ]
+}
+
+fn glyph_rows(ch: char) -> [u8; 7] {
+    match ch {
+        'A' => [
+            0b01110, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+        ],
+        'B' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10001, 0b10001, 0b11110,
+        ],
+        'C' => [
+            0b01111, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b01111,
+        ],
+        'D' => [
+            0b11110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b11110,
+        ],
+        'E' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b11111,
+        ],
+        'F' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b10000, 0b10000, 0b10000,
+        ],
+        'G' => [
+            0b01111, 0b10000, 0b10000, 0b10111, 0b10001, 0b10001, 0b01111,
+        ],
+        'H' => [
+            0b10001, 0b10001, 0b10001, 0b11111, 0b10001, 0b10001, 0b10001,
+        ],
+        'I' => [
+            0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b11111,
+        ],
+        'J' => [
+            0b00111, 0b00010, 0b00010, 0b00010, 0b10010, 0b10010, 0b01100,
+        ],
+        'K' => [
+            0b10001, 0b10010, 0b10100, 0b11000, 0b10100, 0b10010, 0b10001,
+        ],
+        'L' => [
+            0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b10000, 0b11111,
+        ],
+        'M' => [
+            0b10001, 0b11011, 0b10101, 0b10101, 0b10001, 0b10001, 0b10001,
+        ],
+        'N' => [
+            0b10001, 0b11001, 0b10101, 0b10011, 0b10001, 0b10001, 0b10001,
+        ],
+        'O' => [
+            0b01110, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+        ],
+        'P' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10000, 0b10000, 0b10000,
+        ],
+        'Q' => [
+            0b01110, 0b10001, 0b10001, 0b10001, 0b10101, 0b10010, 0b01101,
+        ],
+        'R' => [
+            0b11110, 0b10001, 0b10001, 0b11110, 0b10100, 0b10010, 0b10001,
+        ],
+        'S' => [
+            0b01111, 0b10000, 0b10000, 0b01110, 0b00001, 0b00001, 0b11110,
+        ],
+        'T' => [
+            0b11111, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100, 0b00100,
+        ],
+        'U' => [
+            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01110,
+        ],
+        'V' => [
+            0b10001, 0b10001, 0b10001, 0b10001, 0b10001, 0b01010, 0b00100,
+        ],
+        'W' => [
+            0b10001, 0b10001, 0b10001, 0b10101, 0b10101, 0b10101, 0b01010,
+        ],
+        'X' => [
+            0b10001, 0b10001, 0b01010, 0b00100, 0b01010, 0b10001, 0b10001,
+        ],
+        'Y' => [
+            0b10001, 0b10001, 0b01010, 0b00100, 0b00100, 0b00100, 0b00100,
+        ],
+        'Z' => [
+            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b10000, 0b11111,
+        ],
+        '0' => [
+            0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110,
+        ],
+        '1' => [
+            0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110,
+        ],
+        '2' => [
+            0b01110, 0b10001, 0b00001, 0b00010, 0b00100, 0b01000, 0b11111,
+        ],
+        '3' => [
+            0b11110, 0b00001, 0b00001, 0b01110, 0b00001, 0b00001, 0b11110,
+        ],
+        '4' => [
+            0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010,
+        ],
+        '5' => [
+            0b11111, 0b10000, 0b10000, 0b11110, 0b00001, 0b00001, 0b11110,
+        ],
+        '6' => [
+            0b01110, 0b10000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110,
+        ],
+        '7' => [
+            0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000,
+        ],
+        '8' => [
+            0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110,
+        ],
+        '9' => [
+            0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00001, 0b01110,
+        ],
+        ':' => [
+            0b00000, 0b00100, 0b00100, 0b00000, 0b00100, 0b00100, 0b00000,
+        ],
+        '.' => [
+            0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b01100,
+        ],
+        ',' => [
+            0b00000, 0b00000, 0b00000, 0b00000, 0b00100, 0b00100, 0b01000,
+        ],
+        '-' => [
+            0b00000, 0b00000, 0b00000, 0b11111, 0b00000, 0b00000, 0b00000,
+        ],
+        '_' => [
+            0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b11111,
+        ],
+        '/' => [
+            0b00001, 0b00010, 0b00010, 0b00100, 0b01000, 0b01000, 0b10000,
+        ],
+        '(' => [
+            0b00010, 0b00100, 0b01000, 0b01000, 0b01000, 0b00100, 0b00010,
+        ],
+        ')' => [
+            0b01000, 0b00100, 0b00010, 0b00010, 0b00010, 0b00100, 0b01000,
+        ],
+        '+' => [
+            0b00000, 0b00100, 0b00100, 0b11111, 0b00100, 0b00100, 0b00000,
+        ],
+        '%' => [
+            0b11001, 0b11010, 0b00010, 0b00100, 0b01000, 0b01011, 0b10011,
+        ],
+        _ => [
+            0b01110, 0b10001, 0b00010, 0b00100, 0b00100, 0b00000, 0b00100,
+        ],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1610,5 +2134,27 @@ mod tests {
             VulkanRenderer::estimate_mesh_upload_bytes(&mesh),
             (4 * std::mem::size_of::<MeshVertex>() + 6 * std::mem::size_of::<u32>()) as u64
         );
+    }
+
+    #[test]
+    fn debug_overlay_builds_screen_space_geometry() {
+        let mut scene = RenderScene::default();
+        scene.debug_draws.push(DebugDraw::TextLine {
+            label: "fps".to_owned(),
+            value: "60".to_owned(),
+        });
+        let (vertices, indices) = build_debug_overlay(
+            &scene,
+            vk::Extent2D {
+                width: 1280,
+                height: 720,
+            },
+        );
+        assert!(!vertices.is_empty());
+        assert!(!indices.is_empty());
+        assert_eq!(indices.len() % 6, 0);
+        assert!(vertices.iter().all(|vertex| {
+            (-1.0..=1.0).contains(&vertex.position[0]) && (-1.0..=1.0).contains(&vertex.position[1])
+        }));
     }
 }
