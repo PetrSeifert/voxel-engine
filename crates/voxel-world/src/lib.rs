@@ -280,7 +280,7 @@ pub trait EditLogStore: Send + Sync {
     fn append(&mut self, edit: BlockEdit);
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct InMemoryEditLogStore {
     edits_by_region: HashMap<RegionCoord, Vec<BlockEdit>>,
 }
@@ -351,6 +351,14 @@ impl<G: WorldGenerator, E: EditLogStore> GeneratedWorld<G, E> {
 
     pub fn chunks(&self) -> &ChunkStore {
         &self.chunks
+    }
+
+    pub fn edits_for_region(&self, region: RegionCoord) -> Vec<BlockEdit> {
+        self.edit_log.load_region(region)
+    }
+
+    pub fn insert_chunk(&mut self, chunk: Chunk) {
+        self.chunks.insert(chunk);
     }
 
     pub fn edit_block(&mut self, voxel: VoxelCoord, new_state: BlockState) {

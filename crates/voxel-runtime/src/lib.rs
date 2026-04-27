@@ -1,6 +1,7 @@
-use crossbeam_channel::{Receiver, Sender, unbounded};
+use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
 use glam::{Vec2, Vec3};
 use std::collections::{HashMap, VecDeque};
+use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use tracing::{debug, info};
 use voxel_core::{BlockState, CHUNK_SIZE, ChunkCoord, VoxelCoord};
@@ -10,8 +11,8 @@ use voxel_render::{
 };
 use voxel_vulkan::{VulkanRenderer, VulkanRendererConfig};
 use voxel_world::{
-    BlockRegistry, ChunkProvider, ChunkStreamingState, GeneratedWorld, InMemoryEditLogStore,
-    StreamPlanner, TerrainGenerator,
+    BlockEdit, BlockRegistry, Chunk, ChunkStreamingState, GeneratedWorld, InMemoryEditLogStore,
+    StreamPlanner, TerrainGenerator, WorldGenerator, compute_basic_skylight,
 };
 use winit::{
     application::ApplicationHandler,
@@ -33,16 +34,27 @@ pub struct RuntimeConfig {
     pub horizontal_view_distance: i32,
     pub vertical_view_distance: i32,
     pub max_chunk_jobs_per_tick: usize,
+    pub max_inflight_chunk_jobs: usize,
+    pub max_mesh_uploads_per_tick: usize,
+    pub chunk_worker_threads: usize,
     pub debug_overlay: bool,
 }
 
 impl Default for RuntimeConfig {
     fn default() -> Self {
+        let worker_threads = thread::available_parallelism()
+            .map(usize::from)
+            .unwrap_or(2)
+            .saturating_sub(1)
+            .clamp(1, 4);
         Self {
             seed: 0x5eed,
             horizontal_view_distance: 2,
             vertical_view_distance: 1,
-            max_chunk_jobs_per_tick: 8,
+            max_chunk_jobs_per_tick: 2,
+            max_inflight_chunk_jobs: worker_threads * 2,
+            max_mesh_uploads_per_tick: 1,
+            chunk_worker_threads: worker_threads,
             debug_overlay: true,
         }
     }
@@ -256,27 +268,107 @@ pub struct MeshJobResult {
     pub upload_bytes: u64,
 }
 
-pub struct WorkerChannels {
-    mesh_tx: Sender<MeshJobResult>,
-    mesh_rx: Receiver<MeshJobResult>,
+#[derive(Clone, Debug)]
+struct ChunkBuildResult {
+    chunk: Chunk,
+    mesh_result: MeshJobResult,
 }
 
-impl Default for WorkerChannels {
-    fn default() -> Self {
-        let (mesh_tx, mesh_rx) = unbounded();
-        Self { mesh_tx, mesh_rx }
+#[derive(Clone, Debug)]
+struct MeshJob {
+    coord: ChunkCoord,
+    chunk: Option<Chunk>,
+    edits: Vec<BlockEdit>,
+}
+
+pub struct StreamingWorkers {
+    job_tx: Sender<MeshJob>,
+    result_rx: Receiver<ChunkBuildResult>,
+    _threads: Vec<JoinHandle<()>>,
+}
+
+impl StreamingWorkers {
+    fn new(config: &RuntimeConfig, registry: BlockRegistry) -> Self {
+        let worker_count = config.chunk_worker_threads.max(1);
+        let queue_capacity = config.max_inflight_chunk_jobs.max(worker_count);
+        let (job_tx, job_rx) = bounded(queue_capacity);
+        let (result_tx, result_rx) = unbounded();
+        let mut threads = Vec::with_capacity(worker_count);
+
+        for worker_index in 0..worker_count {
+            let job_rx: Receiver<MeshJob> = job_rx.clone();
+            let result_tx: Sender<ChunkBuildResult> = result_tx.clone();
+            let registry = registry.clone();
+            let generator = TerrainGenerator::new(config.seed);
+            let name = format!("chunk-worker-{worker_index}");
+            let thread = thread::Builder::new()
+                .name(name)
+                .spawn(move || {
+                    while let Ok(job) = job_rx.recv() {
+                        let result = run_mesh_job(job, &generator, &registry);
+                        if result_tx.send(result).is_err() {
+                            break;
+                        }
+                    }
+                })
+                .expect("chunk worker thread should spawn");
+            threads.push(thread);
+        }
+
+        Self {
+            job_tx,
+            result_rx,
+            _threads: threads,
+        }
     }
+}
+
+fn run_mesh_job(
+    MeshJob {
+        coord,
+        chunk,
+        edits,
+    }: MeshJob,
+    generator: &TerrainGenerator,
+    registry: &BlockRegistry,
+) -> ChunkBuildResult {
+    let mut chunk = chunk.unwrap_or_else(|| generator.generate_chunk(coord));
+    if !edits.is_empty() {
+        for edit in edits {
+            let (edit_chunk, local) = edit.voxel.split_chunk_local();
+            if edit_chunk == coord {
+                chunk.set_block(local, edit.new_state);
+            }
+        }
+        compute_basic_skylight(&mut chunk);
+        chunk.clear_dirty();
+    }
+
+    let mesh = mesh_chunk_greedy(&chunk, registry);
+    let upload_bytes = mesh_upload_bytes(&mesh);
+    let mesh_result = MeshJobResult { mesh, upload_bytes };
+    ChunkBuildResult { chunk, mesh_result }
+}
+
+fn mesh_upload_bytes(mesh: &ChunkMesh) -> u64 {
+    mesh.opaque_surfaces
+        .iter()
+        .map(|surface| {
+            surface.vertices.len() * std::mem::size_of::<voxel_mesh::MeshVertex>()
+                + surface.indices.len() * std::mem::size_of::<u32>()
+        })
+        .sum::<usize>() as u64
 }
 
 pub struct EngineRuntime<R: RendererBackend = NullRenderer> {
     config: RuntimeConfig,
     task_graph: TaskGraph,
-    registry: BlockRegistry,
     world: GeneratedWorld<TerrainGenerator, InMemoryEditLogStore>,
     stream_planner: StreamPlanner,
     streaming_states: HashMap<ChunkCoord, ChunkStreamingState>,
     pending_uploads: VecDeque<MeshJobResult>,
-    channels: WorkerChannels,
+    inflight_mesh_jobs: usize,
+    workers: StreamingWorkers,
     renderer: R,
     scene: RenderScene,
     camera_controller: CameraController,
@@ -291,10 +383,12 @@ impl EngineRuntime<NullRenderer> {
 
 impl<R: RendererBackend> EngineRuntime<R> {
     pub fn with_renderer(config: RuntimeConfig, renderer: R) -> Self {
+        let registry = BlockRegistry::default();
         let world = GeneratedWorld::new(
             TerrainGenerator::new(config.seed),
             InMemoryEditLogStore::default(),
         );
+        let workers = StreamingWorkers::new(&config, registry.clone());
         Self {
             stream_planner: StreamPlanner::new(
                 config.horizontal_view_distance,
@@ -302,11 +396,11 @@ impl<R: RendererBackend> EngineRuntime<R> {
             ),
             config,
             task_graph: TaskGraph::default(),
-            registry: BlockRegistry::default(),
             world,
             streaming_states: HashMap::new(),
             pending_uploads: VecDeque::new(),
-            channels: WorkerChannels::default(),
+            inflight_mesh_jobs: 0,
+            workers,
             renderer,
             scene: RenderScene::default(),
             camera_controller: CameraController::default(),
@@ -386,6 +480,14 @@ impl<R: RendererBackend> EngineRuntime<R> {
 
     fn mesh_ready_chunks(&mut self) {
         let mut queued = 0;
+        let capacity = self
+            .config
+            .max_inflight_chunk_jobs
+            .saturating_sub(self.inflight_mesh_jobs);
+        if capacity == 0 {
+            return;
+        }
+
         let coords: Vec<_> = self
             .streaming_states
             .iter()
@@ -399,49 +501,77 @@ impl<R: RendererBackend> EngineRuntime<R> {
             .collect();
 
         for coord in coords {
-            if queued >= self.config.max_chunk_jobs_per_tick {
+            if queued >= self.config.max_chunk_jobs_per_tick || queued >= capacity {
                 break;
             }
 
             self.streaming_states
                 .insert(coord, ChunkStreamingState::Generating);
-            let chunk = self.world.get_or_generate(coord).clone();
+
+            let chunk = self.world.chunks().get(coord).cloned();
+            let edits = if chunk.is_some() {
+                Vec::new()
+            } else {
+                self.world.edits_for_region(coord.region_coord())
+            };
+            let job = MeshJob {
+                coord,
+                chunk,
+                edits,
+            };
+
+            match self.workers.job_tx.try_send(job) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    self.streaming_states
+                        .insert(coord, ChunkStreamingState::Missing);
+                    break;
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    self.streaming_states
+                        .insert(coord, ChunkStreamingState::Missing);
+                    break;
+                }
+            }
+
             self.streaming_states
                 .insert(coord, ChunkStreamingState::Meshing);
-            let mesh = mesh_chunk_greedy(&chunk, &self.registry);
-            let upload_bytes = mesh
-                .opaque_surfaces
-                .iter()
-                .map(|surface| {
-                    surface.vertices.len() * std::mem::size_of::<voxel_mesh::MeshVertex>()
-                        + surface.indices.len() * std::mem::size_of::<u32>()
-                })
-                .sum::<usize>() as u64;
-            let result = MeshJobResult { mesh, upload_bytes };
-            self.channels
-                .mesh_tx
-                .send(result)
-                .expect("runtime owns mesh receiver");
+            self.inflight_mesh_jobs += 1;
             queued += 1;
         }
     }
 
     fn collect_mesh_results(&mut self) {
-        while let Ok(result) = self.channels.mesh_rx.try_recv() {
+        while let Ok(result) = self.workers.result_rx.try_recv() {
+            self.inflight_mesh_jobs = self.inflight_mesh_jobs.saturating_sub(1);
+            let coord = result.mesh_result.mesh.version.chunk;
+            if !matches!(
+                self.streaming_states.get(&coord),
+                Some(ChunkStreamingState::Meshing)
+            ) {
+                continue;
+            }
+
+            self.world.insert_chunk(result.chunk);
             self.streaming_states
-                .insert(result.mesh.version.chunk, ChunkStreamingState::UploadQueued);
-            self.pending_uploads.push_back(result);
+                .insert(coord, ChunkStreamingState::UploadQueued);
+            self.pending_uploads.push_back(result.mesh_result);
         }
     }
 
     fn upload_pending_meshes(&mut self) -> Result<(), RuntimeError> {
         let mut upload_bytes = 0;
-        while let Some(result) = self.pending_uploads.pop_front() {
+        let mut uploaded_meshes = 0;
+        while uploaded_meshes < self.config.max_mesh_uploads_per_tick {
+            let Some(result) = self.pending_uploads.pop_front() else {
+                break;
+            };
             upload_bytes += result.upload_bytes;
             let handle = self.renderer.upload_chunk_mesh(&result.mesh)?;
             self.scene.add_or_replace_mesh(handle, &result.mesh)?;
             self.streaming_states
                 .insert(result.mesh.version.chunk, ChunkStreamingState::Resident);
+            uploaded_meshes += 1;
         }
         self.scene.stats.upload_bytes = upload_bytes;
         Ok(())
@@ -463,8 +593,9 @@ impl<R: RendererBackend> EngineRuntime<R> {
         };
         let resident_chunks = self.scene.chunk_meshes.len();
         let visible_chunks = resident_chunks;
-        let mesh_queue_depth = self.scene.stats.mesh_queue_depth;
+        let mesh_queue_depth = self.inflight_mesh_jobs + self.pending_uploads.len();
         let upload_kib = self.scene.stats.upload_bytes as f32 / 1024.0;
+        self.scene.stats.mesh_queue_depth = mesh_queue_depth;
 
         self.scene.debug_draws.extend([
             DebugDraw::TextLine {
@@ -676,6 +807,21 @@ impl ApplicationHandler for WindowedVulkanApp {
 mod tests {
     use super::*;
 
+    fn tick_until_resident<R: RendererBackend>(
+        runtime: &mut EngineRuntime<R>,
+        resident_chunks: usize,
+    ) -> FrameStats {
+        let mut stats = runtime.tick().unwrap();
+        for _ in 0..100 {
+            if stats.resident_chunks >= resident_chunks {
+                return stats;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+            stats = runtime.tick().unwrap();
+        }
+        stats
+    }
+
     #[test]
     fn task_graph_keeps_expected_order() {
         let graph = TaskGraph::default();
@@ -699,7 +845,7 @@ mod tests {
             max_chunk_jobs_per_tick: 1,
             ..RuntimeConfig::default()
         });
-        let stats = runtime.tick().unwrap();
+        let stats = tick_until_resident(&mut runtime, 1);
         assert_eq!(stats.resident_chunks, 1);
         assert!(!runtime.scene().debug_draws.is_empty());
     }
