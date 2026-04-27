@@ -1,5 +1,5 @@
 use crossbeam_channel::{Receiver, Sender, unbounded};
-use glam::Vec3;
+use glam::{Vec2, Vec3};
 use std::collections::{HashMap, VecDeque};
 use std::time::{Duration, Instant};
 use tracing::{debug, info};
@@ -13,9 +13,10 @@ use voxel_world::{
 };
 use winit::{
     application::ApplicationHandler,
-    event::WindowEvent,
+    event::{ButtonSource, DeviceEvent, ElementState, MouseButton, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
-    window::{Window, WindowAttributes, WindowId},
+    keyboard::{KeyCode, PhysicalKey},
+    window::{CursorGrabMode, Window, WindowAttributes, WindowId},
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -116,6 +117,7 @@ impl TaskGraph {
 #[derive(Clone, Debug)]
 pub struct CameraController {
     pub speed_voxels_per_second: f32,
+    pub boost_multiplier: f32,
     pub sensitivity: f32,
 }
 
@@ -123,18 +125,124 @@ impl Default for CameraController {
     fn default() -> Self {
         Self {
             speed_voxels_per_second: 48.0,
+            boost_multiplier: 4.0,
             sensitivity: 0.002,
         }
     }
 }
 
 impl CameraController {
-    pub fn move_camera(&self, scene: &mut RenderScene, local_delta: Vec3, dt: Duration) {
+    pub fn apply_input(&self, scene: &mut RenderScene, input: FlyCameraInput, dt: Duration) {
+        if input.look_delta != Vec2::ZERO {
+            scene.camera.yaw_radians += input.look_delta.x * self.sensitivity;
+            scene.camera.pitch_radians -= input.look_delta.y * self.sensitivity;
+            let pitch_limit = std::f32::consts::FRAC_PI_2 - 0.01;
+            scene.camera.pitch_radians =
+                scene.camera.pitch_radians.clamp(-pitch_limit, pitch_limit);
+        }
+
+        let mut local_delta = input.movement;
+        if local_delta.length_squared() > 1.0 {
+            local_delta = local_delta.normalize();
+        }
+
+        let speed_multiplier = if input.boost {
+            self.boost_multiplier
+        } else {
+            1.0
+        };
         let forward = scene.camera.forward();
         let right = forward.cross(Vec3::Y).normalize_or_zero();
         let up = Vec3::Y;
         let world_delta = right * local_delta.x + up * local_delta.y + forward * local_delta.z;
-        scene.camera.position += world_delta * self.speed_voxels_per_second * dt.as_secs_f32();
+        scene.camera.position +=
+            world_delta * self.speed_voxels_per_second * speed_multiplier * dt.as_secs_f32();
+    }
+
+    pub fn move_camera(&self, scene: &mut RenderScene, local_delta: Vec3, dt: Duration) {
+        self.apply_input(
+            scene,
+            FlyCameraInput {
+                movement: local_delta,
+                ..FlyCameraInput::default()
+            },
+            dt,
+        );
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct FlyCameraInput {
+    pub movement: Vec3,
+    pub look_delta: Vec2,
+    pub boost: bool,
+}
+
+#[derive(Clone, Debug, Default)]
+struct FlyCameraInputState {
+    forward: bool,
+    backward: bool,
+    left: bool,
+    right: bool,
+    up: bool,
+    down: bool,
+    boost: bool,
+    pointer_locked: bool,
+    pending_look_delta: Vec2,
+}
+
+impl FlyCameraInputState {
+    fn handle_key(&mut self, key: KeyCode, state: ElementState) -> bool {
+        let pressed = state == ElementState::Pressed;
+        match key {
+            KeyCode::KeyW => self.forward = pressed,
+            KeyCode::KeyS => self.backward = pressed,
+            KeyCode::KeyA => self.left = pressed,
+            KeyCode::KeyD => self.right = pressed,
+            KeyCode::Space => self.up = pressed,
+            KeyCode::ControlLeft | KeyCode::ControlRight => self.down = pressed,
+            KeyCode::ShiftLeft | KeyCode::ShiftRight => self.boost = pressed,
+            _ => return false,
+        }
+        true
+    }
+
+    fn push_look_delta(&mut self, delta: (f64, f64)) {
+        if self.pointer_locked {
+            self.pending_look_delta += Vec2::new(delta.0 as f32, delta.1 as f32);
+        }
+    }
+
+    fn frame_input(&mut self) -> FlyCameraInput {
+        let look_delta = std::mem::take(&mut self.pending_look_delta);
+        FlyCameraInput {
+            movement: Vec3::new(
+                axis(self.right, self.left),
+                axis(self.up, self.down),
+                axis(self.forward, self.backward),
+            ),
+            look_delta,
+            boost: self.boost,
+        }
+    }
+
+    fn clear_motion(&mut self) {
+        self.forward = false;
+        self.backward = false;
+        self.left = false;
+        self.right = false;
+        self.up = false;
+        self.down = false;
+        self.boost = false;
+        self.pending_look_delta = Vec2::ZERO;
+    }
+}
+
+fn axis(positive: bool, negative: bool) -> f32 {
+    match (positive, negative) {
+        (true, false) => 1.0,
+        (false, true) => -1.0,
+        _ => 0.0,
     }
 }
 
@@ -222,11 +330,18 @@ impl<R: RendererBackend> EngineRuntime<R> {
     }
 
     pub fn tick(&mut self) -> Result<FrameStats, RuntimeError> {
+        self.tick_with_camera_input(FlyCameraInput::default())
+    }
+
+    pub fn tick_with_camera_input(
+        &mut self,
+        camera_input: FlyCameraInput,
+    ) -> Result<FrameStats, RuntimeError> {
         let now = Instant::now();
         let dt = now.saturating_duration_since(self.last_tick);
         self.last_tick = now;
         self.camera_controller
-            .move_camera(&mut self.scene, Vec3::ZERO, dt);
+            .apply_input(&mut self.scene, camera_input, dt);
 
         self.schedule_visible_chunks();
         self.mesh_ready_chunks();
@@ -348,6 +463,7 @@ struct WindowedVulkanApp {
     window: Option<Box<dyn Window>>,
     window_id: Option<WindowId>,
     config: WindowedVulkanAppConfig,
+    camera_input: FlyCameraInputState,
 }
 
 impl WindowedVulkanApp {
@@ -357,6 +473,25 @@ impl WindowedVulkanApp {
             window: None,
             window_id: None,
             config,
+            camera_input: FlyCameraInputState::default(),
+        }
+    }
+
+    fn set_pointer_locked(&mut self, locked: bool) {
+        self.camera_input.pointer_locked = locked;
+        if let Some(window) = &self.window {
+            if locked {
+                let grabbed = window
+                    .set_cursor_grab(CursorGrabMode::Locked)
+                    .or_else(|_| window.set_cursor_grab(CursorGrabMode::Confined))
+                    .is_ok();
+                self.camera_input.pointer_locked = grabbed;
+                window.set_cursor_visible(!grabbed);
+            } else {
+                let _ = window.set_cursor_grab(CursorGrabMode::None);
+                window.set_cursor_visible(true);
+                self.camera_input.clear_motion();
+            }
         }
     }
 
@@ -413,14 +548,34 @@ impl ApplicationHandler for WindowedVulkanApp {
 
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
+            WindowEvent::Focused(false) => {
+                self.set_pointer_locked(false);
+            }
             WindowEvent::SurfaceResized(size) => {
                 if let Some(runtime) = &mut self.runtime {
                     runtime.renderer_mut().resize(size.width, size.height);
                 }
             }
+            WindowEvent::KeyboardInput { event, .. } => {
+                if let PhysicalKey::Code(key) = event.physical_key {
+                    if key == KeyCode::Escape && event.state == ElementState::Pressed {
+                        self.set_pointer_locked(false);
+                    } else {
+                        self.camera_input.handle_key(key, event.state);
+                    }
+                }
+            }
+            WindowEvent::PointerButton {
+                state,
+                button: ButtonSource::Mouse(MouseButton::Left),
+                ..
+            } if state == ElementState::Pressed => {
+                self.set_pointer_locked(true);
+            }
             WindowEvent::RedrawRequested => {
+                let input = self.camera_input.frame_input();
                 if let Some(runtime) = &mut self.runtime {
-                    if let Err(error) = runtime.tick() {
+                    if let Err(error) = runtime.tick_with_camera_input(input) {
                         eprintln!("runtime tick failed: {error}");
                         event_loop.exit();
                         return;
@@ -431,6 +586,17 @@ impl ApplicationHandler for WindowedVulkanApp {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &dyn ActiveEventLoop,
+        _device_id: Option<winit::event::DeviceId>,
+        event: DeviceEvent,
+    ) {
+        if let DeviceEvent::PointerMotion { delta } = event {
+            self.camera_input.push_look_delta(delta);
         }
     }
 }
@@ -464,5 +630,38 @@ mod tests {
         });
         let stats = runtime.tick().unwrap();
         assert_eq!(stats.resident_chunks, 1);
+    }
+
+    #[test]
+    fn fly_camera_moves_forward_in_view_direction() {
+        let controller = CameraController::default();
+        let mut scene = RenderScene::default();
+        let start = scene.camera.position;
+        controller.apply_input(
+            &mut scene,
+            FlyCameraInput {
+                movement: Vec3::Z,
+                ..FlyCameraInput::default()
+            },
+            Duration::from_secs(1),
+        );
+        let delta = scene.camera.position - start;
+        assert!(delta.dot(scene.camera.forward()) > 47.0);
+    }
+
+    #[test]
+    fn fly_camera_accumulates_key_axes_and_consumes_mouse_delta() {
+        let mut input = FlyCameraInputState::default();
+        input.pointer_locked = true;
+        assert!(input.handle_key(KeyCode::KeyW, ElementState::Pressed));
+        assert!(input.handle_key(KeyCode::KeyD, ElementState::Pressed));
+        assert!(input.handle_key(KeyCode::ShiftLeft, ElementState::Pressed));
+        input.push_look_delta((10.0, -5.0));
+
+        let frame = input.frame_input();
+        assert_eq!(frame.movement, Vec3::new(1.0, 0.0, 1.0));
+        assert_eq!(frame.look_delta, Vec2::new(10.0, -5.0));
+        assert!(frame.boost);
+        assert_eq!(input.frame_input().look_delta, Vec2::ZERO);
     }
 }
