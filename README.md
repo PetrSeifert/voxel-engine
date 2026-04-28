@@ -17,8 +17,12 @@ Rust/Vulkan voxel engine workspace targeting Windows and Linux desktops.
 ## Useful Commands
 
 ```powershell
+# One-time setup (Windows): just install Vulkan SDK (no build).
+.\scripts\setup-vulkan-sdk.ps1
+
 cargo test
 cargo run -p sandbox
 cargo run -p chunk_bench
 cargo run -p shader_lab
 ```
+
