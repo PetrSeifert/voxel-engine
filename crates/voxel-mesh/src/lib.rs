@@ -753,6 +753,33 @@ mod tests {
     }
 
     #[test]
+    fn water_neighbor_culls_shared_boundary_face() {
+        let registry = BlockRegistry::default();
+        let mut chunk = Chunk::empty(ChunkCoord::ZERO);
+        chunk.set_block(
+            LocalVoxelCoord::new_unchecked((CHUNK_SIZE_USIZE - 1) as u8, 1, 1),
+            BlockState::new(BlockId::WATER),
+        );
+        let mut pos_x = Chunk::empty(ChunkCoord::new(1, 0, 0));
+        pos_x.set_block(
+            LocalVoxelCoord::new_unchecked(0, 1, 1),
+            BlockState::new(BlockId::WATER),
+        );
+
+        let mesh = mesh_chunk_greedy_with_neighbors(
+            &chunk,
+            &registry,
+            ChunkNeighbors {
+                pos_x: Some(&pos_x),
+                ..ChunkNeighbors::default()
+            },
+        );
+
+        assert_eq!(mesh.opaque_quad_count(), 0);
+        assert_eq!(mesh.transparent_quad_count(), 5);
+    }
+
+    #[test]
     fn edge_ao_samples_cardinal_neighbor_chunks() {
         let mut chunk = Chunk::empty(ChunkCoord::ZERO);
         chunk.set_block(

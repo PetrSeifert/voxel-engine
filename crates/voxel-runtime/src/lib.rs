@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use tracing::{debug, info};
-use voxel_core::{BlockState, CHUNK_SIZE, ChunkCoord, Direction, VoxelCoord};
+use voxel_core::{BlockId, BlockState, CHUNK_SIZE, ChunkCoord, Direction, VoxelCoord};
 use voxel_mesh::{ChunkMesh, ChunkNeighbors, mesh_chunk_greedy_with_neighbors};
 use voxel_render::{
     DebugDraw, FrameStats, NullRenderer, RenderError, RenderScene, RendererBackend,
@@ -286,6 +286,7 @@ struct MeshJob {
     chunk: Option<Arc<Chunk>>,
     neighbors: NeighborChunks,
     edits: Vec<BlockEdit>,
+    neighbor_edits: NeighborEdits,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -299,6 +300,58 @@ struct NeighborChunks {
 }
 
 impl NeighborChunks {
+    fn with_generated_missing(
+        self,
+        coord: ChunkCoord,
+        edits: NeighborEdits,
+        generator: &TerrainGenerator,
+    ) -> Self {
+        Self {
+            neg_x: self.neg_x.or_else(|| {
+                Some(Arc::new(generate_chunk_with_edits(
+                    coord.offset(-1, 0, 0),
+                    edits.neg_x,
+                    generator,
+                )))
+            }),
+            pos_x: self.pos_x.or_else(|| {
+                Some(Arc::new(generate_chunk_with_edits(
+                    coord.offset(1, 0, 0),
+                    edits.pos_x,
+                    generator,
+                )))
+            }),
+            neg_y: self.neg_y.or_else(|| {
+                Some(Arc::new(generate_chunk_with_edits(
+                    coord.offset(0, -1, 0),
+                    edits.neg_y,
+                    generator,
+                )))
+            }),
+            pos_y: self.pos_y.or_else(|| {
+                Some(Arc::new(generate_chunk_with_edits(
+                    coord.offset(0, 1, 0),
+                    edits.pos_y,
+                    generator,
+                )))
+            }),
+            neg_z: self.neg_z.or_else(|| {
+                Some(Arc::new(generate_chunk_with_edits(
+                    coord.offset(0, 0, -1),
+                    edits.neg_z,
+                    generator,
+                )))
+            }),
+            pos_z: self.pos_z.or_else(|| {
+                Some(Arc::new(generate_chunk_with_edits(
+                    coord.offset(0, 0, 1),
+                    edits.pos_z,
+                    generator,
+                )))
+            }),
+        }
+    }
+
     fn as_refs(&self) -> ChunkNeighbors<'_> {
         ChunkNeighbors {
             neg_x: self.neg_x.as_deref(),
@@ -358,10 +411,12 @@ fn run_mesh_job(
         chunk,
         neighbors,
         edits,
+        neighbor_edits,
     }: MeshJob,
     generator: &TerrainGenerator,
     registry: &BlockRegistry,
 ) -> ChunkBuildResult {
+    let neighbors = neighbors.with_generated_missing(coord, neighbor_edits, generator);
     if let Some(chunk) = chunk {
         let mesh = mesh_chunk_greedy_with_neighbors(&chunk, registry, neighbors.as_refs());
         let upload_bytes = mesh_upload_bytes(&mesh);
@@ -403,7 +458,34 @@ fn generate_chunk_with_edits(
     chunk
 }
 
-fn chunk_boundary_has_opaque(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum NeighborMeshClass {
+    Air,
+    Opaque,
+    Transparent(BlockId),
+}
+
+fn neighbor_mesh_class(state: BlockState, registry: &BlockRegistry) -> NeighborMeshClass {
+    if state.id.is_air() {
+        NeighborMeshClass::Air
+    } else if registry.is_opaque(state) {
+        NeighborMeshClass::Opaque
+    } else {
+        NeighborMeshClass::Transparent(state.id)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct NeighborEdits {
+    neg_x: Vec<BlockEdit>,
+    pos_x: Vec<BlockEdit>,
+    neg_y: Vec<BlockEdit>,
+    pos_y: Vec<BlockEdit>,
+    neg_z: Vec<BlockEdit>,
+    pos_z: Vec<BlockEdit>,
+}
+
+fn chunk_boundary_affects_neighbor_mesh(
     chunk: &Chunk,
     direction: Direction,
     registry: &BlockRegistry,
@@ -421,7 +503,7 @@ fn chunk_boundary_has_opaque(
                 Direction::NegZ => voxel_core::LocalVoxelCoord::new_unchecked(u, v, 0),
                 Direction::PosZ => voxel_core::LocalVoxelCoord::new_unchecked(u, v, edge),
             };
-            if registry.is_opaque(chunk.block(local)) {
+            if neighbor_mesh_class(chunk.block(local), registry) != NeighborMeshClass::Air {
                 return true;
             }
         }
@@ -522,15 +604,16 @@ impl<R: RendererBackend> EngineRuntime<R> {
             .chunks()
             .get(coord)
             .map(|chunk| chunk.block(local));
-        let boundary_opacity_changed = old_state
+        let neighbor_mesh_class_changed = old_state
             .map(|old_state| {
-                self.block_registry.is_opaque(old_state) != self.block_registry.is_opaque(state)
+                neighbor_mesh_class(old_state, &self.block_registry)
+                    != neighbor_mesh_class(state, &self.block_registry)
             })
             .unwrap_or(true);
 
         self.world.edit_block(voxel, state);
         self.mark_chunk_for_remesh(coord);
-        if !boundary_opacity_changed {
+        if !neighbor_mesh_class_changed {
             return;
         }
         if local.x == 0 {
@@ -652,11 +735,13 @@ impl<R: RendererBackend> EngineRuntime<R> {
                 self.world.edits_for_region(coord.region_coord())
             };
             let neighbors = self.neighbor_chunks(coord);
+            let neighbor_edits = self.neighbor_edits(coord, &neighbors);
             let job = MeshJob {
                 coord,
                 chunk,
                 neighbors,
                 edits,
+                neighbor_edits,
             };
 
             match self.workers.job_tx.try_send(job) {
@@ -754,6 +839,25 @@ impl<R: RendererBackend> EngineRuntime<R> {
         }
     }
 
+    fn neighbor_edits(&self, coord: ChunkCoord, neighbors: &NeighborChunks) -> NeighborEdits {
+        let edits_for_missing = |neighbor: &Option<Arc<Chunk>>, coord: ChunkCoord| {
+            if neighbor.is_some() {
+                Vec::new()
+            } else {
+                self.world.edits_for_region(coord.region_coord())
+            }
+        };
+
+        NeighborEdits {
+            neg_x: edits_for_missing(&neighbors.neg_x, coord.offset(-1, 0, 0)),
+            pos_x: edits_for_missing(&neighbors.pos_x, coord.offset(1, 0, 0)),
+            neg_y: edits_for_missing(&neighbors.neg_y, coord.offset(0, -1, 0)),
+            pos_y: edits_for_missing(&neighbors.pos_y, coord.offset(0, 1, 0)),
+            neg_z: edits_for_missing(&neighbors.neg_z, coord.offset(0, 0, -1)),
+            pos_z: edits_for_missing(&neighbors.pos_z, coord.offset(0, 0, 1)),
+        }
+    }
+
     fn mark_loaded_neighbors_for_remesh(&mut self, coord: ChunkCoord) {
         // Only call this after first-generation mesh results. Re-mesh jobs must not
         // enqueue their neighbors, or adjacent chunks can bounce each other between
@@ -767,7 +871,8 @@ impl<R: RendererBackend> EngineRuntime<R> {
                 .iter()
                 .enumerate()
                 .fold(0u8, |mask, (index, &direction)| {
-                    if chunk_boundary_has_opaque(chunk, direction, &self.block_registry) {
+                    if chunk_boundary_affects_neighbor_mesh(chunk, direction, &self.block_registry)
+                    {
                         mask | (1u8 << index)
                     } else {
                         mask
@@ -1083,6 +1188,17 @@ mod tests {
         }
     }
 
+    fn generated_neighbors(coord: ChunkCoord, generator: &TerrainGenerator) -> NeighborChunks {
+        NeighborChunks {
+            neg_x: Some(Arc::new(generator.generate_chunk(coord.offset(-1, 0, 0)))),
+            pos_x: Some(Arc::new(generator.generate_chunk(coord.offset(1, 0, 0)))),
+            neg_y: Some(Arc::new(generator.generate_chunk(coord.offset(0, -1, 0)))),
+            pos_y: Some(Arc::new(generator.generate_chunk(coord.offset(0, 1, 0)))),
+            neg_z: Some(Arc::new(generator.generate_chunk(coord.offset(0, 0, -1)))),
+            pos_z: Some(Arc::new(generator.generate_chunk(coord.offset(0, 0, 1)))),
+        }
+    }
+
     #[test]
     fn task_graph_keeps_expected_order() {
         let graph = TaskGraph::default();
@@ -1254,6 +1370,102 @@ mod tests {
         assert_eq!(
             runtime.streaming_states.get(&neighbor),
             Some(&ChunkStreamingState::Generated)
+        );
+    }
+
+    #[test]
+    fn border_water_edit_marks_adjacent_loaded_chunk_for_remesh() {
+        let mut runtime = EngineRuntime::new_headless(RuntimeConfig {
+            horizontal_view_distance: 0,
+            vertical_view_distance: 0,
+            max_chunk_jobs_per_tick: 1,
+            ..RuntimeConfig::default()
+        });
+        let coord = ChunkCoord::ZERO;
+        let neighbor = coord.offset(1, 0, 0);
+        runtime.world.insert_chunk(Chunk::empty(coord));
+        runtime.world.insert_chunk(Chunk::empty(neighbor));
+
+        runtime.edit_block(
+            VoxelCoord::new(CHUNK_SIZE - 1, 0, 0),
+            BlockState::new(voxel_core::BlockId::WATER),
+        );
+
+        assert_eq!(
+            runtime.streaming_states.get(&coord),
+            Some(&ChunkStreamingState::Generated)
+        );
+        assert_eq!(
+            runtime.streaming_states.get(&neighbor),
+            Some(&ChunkStreamingState::Generated)
+        );
+    }
+
+    #[test]
+    fn loaded_water_boundary_marks_neighbor_for_remesh() {
+        let mut runtime = EngineRuntime::new_headless(RuntimeConfig {
+            horizontal_view_distance: 0,
+            vertical_view_distance: 0,
+            max_chunk_jobs_per_tick: 1,
+            ..RuntimeConfig::default()
+        });
+        let coord = ChunkCoord::ZERO;
+        let neighbor = coord.offset(1, 0, 0);
+        let mut chunk = Chunk::empty(coord);
+        chunk.set_block(
+            voxel_core::LocalVoxelCoord::new_unchecked((CHUNK_SIZE - 1) as u8, 1, 1),
+            BlockState::new(voxel_core::BlockId::WATER),
+        );
+        runtime.world.insert_chunk(chunk);
+        runtime.world.insert_chunk(Chunk::empty(neighbor));
+
+        runtime.mark_loaded_neighbors_for_remesh(coord);
+
+        assert_eq!(
+            runtime.streaming_states.get(&neighbor),
+            Some(&ChunkStreamingState::Generated)
+        );
+    }
+
+    #[test]
+    fn initial_mesh_uses_generated_missing_neighbors_for_boundary_culling() {
+        let registry = BlockRegistry::default();
+        let generator = TerrainGenerator::new(0x5eed);
+        let coord = (-2..=2)
+            .flat_map(|x| {
+                (-1..=1).flat_map(move |y| (-2..=2).map(move |z| ChunkCoord::new(x, y, z)))
+            })
+            .find(|&coord| {
+                let chunk = generator.generate_chunk(coord);
+                let isolated =
+                    mesh_chunk_greedy_with_neighbors(&chunk, &registry, ChunkNeighbors::default());
+                let neighbors = generated_neighbors(coord, &generator);
+                let neighbor_aware =
+                    mesh_chunk_greedy_with_neighbors(&chunk, &registry, neighbors.as_refs());
+                neighbor_aware.quad_count() < isolated.quad_count()
+            })
+            .expect("sampled terrain should contain cross-chunk faces to cull");
+
+        let chunk = generator.generate_chunk(coord);
+        let expected_neighbors = generated_neighbors(coord, &generator);
+        let expected =
+            mesh_chunk_greedy_with_neighbors(&chunk, &registry, expected_neighbors.as_refs());
+        let result = run_mesh_job(
+            MeshJob {
+                coord,
+                chunk: Some(Arc::new(chunk)),
+                neighbors: NeighborChunks::default(),
+                edits: Vec::new(),
+                neighbor_edits: NeighborEdits::default(),
+            },
+            &generator,
+            &registry,
+        );
+
+        assert_eq!(result.mesh_result.mesh.quad_count(), expected.quad_count());
+        assert_eq!(
+            result.mesh_result.mesh.transparent_quad_count(),
+            expected.transparent_quad_count()
         );
     }
 
