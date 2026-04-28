@@ -1,11 +1,12 @@
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded, unbounded};
 use glam::{Vec2, Vec3};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use tracing::{debug, info};
-use voxel_core::{BlockState, CHUNK_SIZE, ChunkCoord, VoxelCoord};
-use voxel_mesh::{ChunkMesh, mesh_chunk_greedy};
+use voxel_core::{BlockState, CHUNK_SIZE, ChunkCoord, Direction, VoxelCoord};
+use voxel_mesh::{ChunkMesh, ChunkNeighbors, mesh_chunk_greedy_with_neighbors};
 use voxel_render::{
     DebugDraw, FrameStats, NullRenderer, RenderError, RenderScene, RendererBackend,
 };
@@ -270,7 +271,7 @@ pub struct MeshJobResult {
 
 #[derive(Clone, Debug)]
 struct ChunkBuildResult {
-    chunk: Chunk,
+    chunk: Option<Chunk>,
     mesh_result: MeshJobResult,
 }
 
@@ -282,8 +283,32 @@ struct ActiveChunkSet {
 #[derive(Clone, Debug)]
 struct MeshJob {
     coord: ChunkCoord,
-    chunk: Option<Chunk>,
+    chunk: Option<Arc<Chunk>>,
+    neighbors: NeighborChunks,
     edits: Vec<BlockEdit>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct NeighborChunks {
+    neg_x: Option<Arc<Chunk>>,
+    pos_x: Option<Arc<Chunk>>,
+    neg_y: Option<Arc<Chunk>>,
+    pos_y: Option<Arc<Chunk>>,
+    neg_z: Option<Arc<Chunk>>,
+    pos_z: Option<Arc<Chunk>>,
+}
+
+impl NeighborChunks {
+    fn as_refs(&self) -> ChunkNeighbors<'_> {
+        ChunkNeighbors {
+            neg_x: self.neg_x.as_deref(),
+            pos_x: self.pos_x.as_deref(),
+            neg_y: self.neg_y.as_deref(),
+            pos_y: self.pos_y.as_deref(),
+            neg_z: self.neg_z.as_deref(),
+            pos_z: self.pos_z.as_deref(),
+        }
+    }
 }
 
 pub struct StreamingWorkers {
@@ -331,27 +356,77 @@ fn run_mesh_job(
     MeshJob {
         coord,
         chunk,
+        neighbors,
         edits,
     }: MeshJob,
     generator: &TerrainGenerator,
     registry: &BlockRegistry,
 ) -> ChunkBuildResult {
-    let mut chunk = chunk.unwrap_or_else(|| generator.generate_chunk(coord));
-    if !edits.is_empty() {
-        for edit in edits {
-            let (edit_chunk, local) = edit.voxel.split_chunk_local();
-            if edit_chunk == coord {
-                chunk.set_block(local, edit.new_state);
-            }
+    if let Some(chunk) = chunk {
+        let mesh = mesh_chunk_greedy_with_neighbors(&chunk, registry, neighbors.as_refs());
+        let upload_bytes = mesh_upload_bytes(&mesh);
+        let mesh_result = MeshJobResult { mesh, upload_bytes };
+        ChunkBuildResult {
+            chunk: None,
+            mesh_result,
         }
-        compute_basic_skylight(&mut chunk);
-        chunk.clear_dirty();
+    } else {
+        let chunk = generate_chunk_with_edits(coord, edits, generator);
+        let mesh = mesh_chunk_greedy_with_neighbors(&chunk, registry, neighbors.as_refs());
+        let upload_bytes = mesh_upload_bytes(&mesh);
+        let mesh_result = MeshJobResult { mesh, upload_bytes };
+        ChunkBuildResult {
+            chunk: Some(chunk),
+            mesh_result,
+        }
+    }
+}
+
+fn generate_chunk_with_edits(
+    coord: ChunkCoord,
+    edits: Vec<BlockEdit>,
+    generator: &TerrainGenerator,
+) -> Chunk {
+    let mut chunk = generator.generate_chunk(coord);
+    if edits.is_empty() {
+        return chunk;
     }
 
-    let mesh = mesh_chunk_greedy(&chunk, registry);
-    let upload_bytes = mesh_upload_bytes(&mesh);
-    let mesh_result = MeshJobResult { mesh, upload_bytes };
-    ChunkBuildResult { chunk, mesh_result }
+    for edit in edits {
+        let (edit_chunk, local) = edit.voxel.split_chunk_local();
+        if edit_chunk == coord {
+            chunk.set_block(local, edit.new_state);
+        }
+    }
+    compute_basic_skylight(&mut chunk);
+    chunk.clear_dirty();
+    chunk
+}
+
+fn chunk_boundary_has_opaque(
+    chunk: &Chunk,
+    direction: Direction,
+    registry: &BlockRegistry,
+) -> bool {
+    let edge = (CHUNK_SIZE - 1) as u8;
+    let size = CHUNK_SIZE as u8;
+
+    for v in 0..size {
+        for u in 0..size {
+            let local = match direction {
+                Direction::NegX => voxel_core::LocalVoxelCoord::new_unchecked(0, u, v),
+                Direction::PosX => voxel_core::LocalVoxelCoord::new_unchecked(edge, u, v),
+                Direction::NegY => voxel_core::LocalVoxelCoord::new_unchecked(v, 0, u),
+                Direction::PosY => voxel_core::LocalVoxelCoord::new_unchecked(v, edge, u),
+                Direction::NegZ => voxel_core::LocalVoxelCoord::new_unchecked(u, v, 0),
+                Direction::PosZ => voxel_core::LocalVoxelCoord::new_unchecked(u, v, edge),
+            };
+            if registry.is_opaque(chunk.block(local)) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 fn mesh_upload_bytes(mesh: &ChunkMesh) -> u64 {
@@ -367,11 +442,13 @@ fn mesh_upload_bytes(mesh: &ChunkMesh) -> u64 {
 pub struct EngineRuntime<R: RendererBackend = NullRenderer> {
     config: RuntimeConfig,
     task_graph: TaskGraph,
+    block_registry: BlockRegistry,
     world: GeneratedWorld<TerrainGenerator, InMemoryEditLogStore>,
     stream_planner: StreamPlanner,
     streaming_states: HashMap<ChunkCoord, ChunkStreamingState>,
     pending_uploads: VecDeque<MeshJobResult>,
     inflight_mesh_jobs: HashSet<ChunkCoord>,
+    dirty_inflight_mesh_jobs: HashSet<ChunkCoord>,
     workers: StreamingWorkers,
     renderer: R,
     scene: RenderScene,
@@ -400,10 +477,12 @@ impl<R: RendererBackend> EngineRuntime<R> {
             ),
             config,
             task_graph: TaskGraph::default(),
+            block_registry: registry,
             world,
             streaming_states: HashMap::new(),
             pending_uploads: VecDeque::new(),
             inflight_mesh_jobs: HashSet::new(),
+            dirty_inflight_mesh_jobs: HashSet::new(),
             workers,
             renderer,
             scene: RenderScene::default(),
@@ -436,10 +515,38 @@ impl<R: RendererBackend> EngineRuntime<R> {
     }
 
     pub fn edit_block(&mut self, voxel: VoxelCoord, state: BlockState) {
+        let (coord, local) = voxel.split_chunk_local();
+        let old_state = self
+            .world
+            .chunks()
+            .get(coord)
+            .map(|chunk| chunk.block(local));
+        let boundary_opacity_changed = old_state
+            .map(|old_state| {
+                self.block_registry.is_opaque(old_state) != self.block_registry.is_opaque(state)
+            })
+            .unwrap_or(true);
+
         self.world.edit_block(voxel, state);
-        let (coord, _) = voxel.split_chunk_local();
-        self.streaming_states
-            .insert(coord, ChunkStreamingState::Generated);
+        self.mark_chunk_for_remesh(coord);
+        if !boundary_opacity_changed {
+            return;
+        }
+        if local.x == 0 {
+            self.mark_chunk_for_remesh(coord.offset(-1, 0, 0));
+        } else if local.x as i32 == CHUNK_SIZE - 1 {
+            self.mark_chunk_for_remesh(coord.offset(1, 0, 0));
+        }
+        if local.y == 0 {
+            self.mark_chunk_for_remesh(coord.offset(0, -1, 0));
+        } else if local.y as i32 == CHUNK_SIZE - 1 {
+            self.mark_chunk_for_remesh(coord.offset(0, 1, 0));
+        }
+        if local.z == 0 {
+            self.mark_chunk_for_remesh(coord.offset(0, 0, -1));
+        } else if local.z as i32 == CHUNK_SIZE - 1 {
+            self.mark_chunk_for_remesh(coord.offset(0, 0, 1));
+        }
     }
 
     pub fn tick(&mut self) -> Result<FrameStats, RuntimeError> {
@@ -506,6 +613,7 @@ impl<R: RendererBackend> EngineRuntime<R> {
             self.world.remove_chunk(coord);
             self.streaming_states.remove(&coord);
             self.inflight_mesh_jobs.remove(&coord);
+            self.dirty_inflight_mesh_jobs.remove(&coord);
         }
     }
 
@@ -536,15 +644,17 @@ impl<R: RendererBackend> EngineRuntime<R> {
             self.streaming_states
                 .insert(coord, ChunkStreamingState::Generating);
 
-            let chunk = self.world.chunks().get(coord).cloned();
+            let chunk = self.world.chunks().get_arc(coord);
             let edits = if chunk.is_some() {
                 Vec::new()
             } else {
                 self.world.edits_for_region(coord.region_coord())
             };
+            let neighbors = self.neighbor_chunks(coord);
             let job = MeshJob {
                 coord,
                 chunk,
+                neighbors,
                 edits,
             };
 
@@ -573,6 +683,7 @@ impl<R: RendererBackend> EngineRuntime<R> {
         while let Ok(result) = self.workers.result_rx.try_recv() {
             let coord = result.mesh_result.mesh.version.chunk;
             let was_inflight = self.inflight_mesh_jobs.remove(&coord);
+            let was_dirtied = self.dirty_inflight_mesh_jobs.remove(&coord);
             if !matches!(
                 self.streaming_states.get(&coord),
                 Some(ChunkStreamingState::Meshing)
@@ -581,7 +692,21 @@ impl<R: RendererBackend> EngineRuntime<R> {
                 continue;
             }
 
-            self.world.insert_chunk(result.chunk);
+            if was_dirtied {
+                let next_state =
+                    if result.chunk.is_some() && self.world.chunks().get(coord).is_none() {
+                        ChunkStreamingState::Missing
+                    } else {
+                        ChunkStreamingState::Generated
+                    };
+                self.streaming_states.insert(coord, next_state);
+                continue;
+            }
+
+            if let Some(chunk) = result.chunk {
+                self.world.insert_chunk(chunk);
+                self.mark_loaded_neighbors_for_remesh(coord);
+            }
             self.streaming_states
                 .insert(coord, ChunkStreamingState::UploadQueued);
             self.pending_uploads.push_back(result.mesh_result);
@@ -595,15 +720,77 @@ impl<R: RendererBackend> EngineRuntime<R> {
             let Some(result) = self.pending_uploads.pop_front() else {
                 break;
             };
+            let coord = result.mesh.version.chunk;
+            if !matches!(
+                self.streaming_states.get(&coord),
+                Some(ChunkStreamingState::UploadQueued)
+            ) || self.world.chunks().get(coord).is_none()
+            {
+                continue;
+            }
             upload_bytes += result.upload_bytes;
             let handle = self.renderer.upload_chunk_mesh(&result.mesh)?;
+            if let Some(resident) = self.scene.chunk_meshes.get(&coord) {
+                self.renderer.remove_chunk_mesh(resident.handle);
+            }
             self.scene.add_or_replace_mesh(handle, &result.mesh)?;
             self.streaming_states
-                .insert(result.mesh.version.chunk, ChunkStreamingState::Resident);
+                .insert(coord, ChunkStreamingState::Resident);
             uploaded_meshes += 1;
         }
         self.scene.stats.upload_bytes = upload_bytes;
         Ok(())
+    }
+
+    fn neighbor_chunks(&self, coord: ChunkCoord) -> NeighborChunks {
+        NeighborChunks {
+            neg_x: self.world.chunks().get_arc(coord.offset(-1, 0, 0)),
+            pos_x: self.world.chunks().get_arc(coord.offset(1, 0, 0)),
+            neg_y: self.world.chunks().get_arc(coord.offset(0, -1, 0)),
+            pos_y: self.world.chunks().get_arc(coord.offset(0, 1, 0)),
+            neg_z: self.world.chunks().get_arc(coord.offset(0, 0, -1)),
+            pos_z: self.world.chunks().get_arc(coord.offset(0, 0, 1)),
+        }
+    }
+
+    fn mark_loaded_neighbors_for_remesh(&mut self, coord: ChunkCoord) {
+        // Only call this after first-generation mesh results. Re-mesh jobs must not
+        // enqueue their neighbors, or adjacent chunks can bounce each other between
+        // re-mesh states indefinitely.
+        let Some(chunk) = self.world.chunks().get(coord) else {
+            return;
+        };
+
+        let remesh_direction_mask = Direction::ALL
+            .iter()
+            .enumerate()
+            .fold(0u8, |mask, (index, &direction)| {
+                if chunk_boundary_has_opaque(chunk, direction, &self.block_registry) {
+                    mask | (1u8 << index)
+                } else {
+                    mask
+                }
+            });
+
+        for (index, direction) in Direction::ALL.iter().copied().enumerate() {
+            if remesh_direction_mask & (1u8 << index) == 0 {
+                continue;
+            }
+            let [dx, dy, dz] = direction.normal();
+            self.mark_chunk_for_remesh(coord.offset(dx, dy, dz));
+        }
+    }
+
+    fn mark_chunk_for_remesh(&mut self, coord: ChunkCoord) {
+        if self.inflight_mesh_jobs.contains(&coord) {
+            self.dirty_inflight_mesh_jobs.insert(coord);
+            return;
+        }
+        if self.world.chunks().get(coord).is_some() || self.scene.chunk_meshes.contains_key(&coord)
+        {
+            self.streaming_states
+                .insert(coord, ChunkStreamingState::Generated);
+        }
     }
 
     fn update_debug_overlay(&mut self) {
@@ -835,6 +1022,33 @@ impl ApplicationHandler for WindowedVulkanApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
+    use voxel_render::MeshHandle;
+
+    #[derive(Default)]
+    struct RecordingRenderer {
+        next_handle: u64,
+        quad_counts: HashMap<ChunkCoord, usize>,
+    }
+
+    impl RendererBackend for RecordingRenderer {
+        fn upload_chunk_mesh(&mut self, mesh: &ChunkMesh) -> Result<MeshHandle, RenderError> {
+            self.next_handle += 1;
+            self.quad_counts
+                .insert(mesh.version.chunk, mesh.opaque_quad_count());
+            Ok(MeshHandle(self.next_handle))
+        }
+
+        fn remove_chunk_mesh(&mut self, _handle: MeshHandle) {}
+
+        fn render_frame(&mut self, scene: &RenderScene) -> Result<FrameStats, RenderError> {
+            let mut stats = scene.stats.clone();
+            stats.frame_index += 1;
+            stats.visible_chunks = scene.chunk_meshes.len();
+            stats.resident_chunks = scene.chunk_meshes.len();
+            Ok(stats)
+        }
+    }
 
     fn tick_until_resident<R: RendererBackend>(
         runtime: &mut EngineRuntime<R>,
@@ -849,6 +1063,22 @@ mod tests {
             stats = runtime.tick().unwrap();
         }
         stats
+    }
+
+    fn process_selected_chunks(
+        runtime: &mut EngineRuntime<RecordingRenderer>,
+        ordered: &[ChunkCoord],
+        expected_uploads: usize,
+    ) {
+        for _ in 0..100 {
+            runtime.mesh_ready_chunks(ordered);
+            std::thread::sleep(Duration::from_millis(1));
+            runtime.collect_mesh_results();
+            runtime.upload_pending_meshes().unwrap();
+            if runtime.renderer.quad_counts.len() >= expected_uploads {
+                return;
+            }
+        }
     }
 
     #[test]
@@ -995,6 +1225,192 @@ mod tests {
         assert!(runtime.world.chunks().get(next_chunk).is_some());
         assert_eq!(runtime.scene().chunk_meshes.len(), 1);
         assert_eq!(runtime.world.chunks().len(), 1);
+    }
+
+    #[test]
+    fn border_edit_marks_adjacent_loaded_chunk_for_remesh() {
+        let mut runtime = EngineRuntime::new_headless(RuntimeConfig {
+            horizontal_view_distance: 0,
+            vertical_view_distance: 0,
+            max_chunk_jobs_per_tick: 1,
+            ..RuntimeConfig::default()
+        });
+        let coord = ChunkCoord::ZERO;
+        let neighbor = coord.offset(1, 0, 0);
+        runtime.world.insert_chunk(Chunk::empty(coord));
+        runtime.world.insert_chunk(Chunk::empty(neighbor));
+
+        runtime.edit_block(
+            VoxelCoord::new(CHUNK_SIZE - 1, 0, 0),
+            BlockState::new(voxel_core::BlockId::STONE),
+        );
+
+        assert_eq!(
+            runtime.streaming_states.get(&coord),
+            Some(&ChunkStreamingState::Generated)
+        );
+        assert_eq!(
+            runtime.streaming_states.get(&neighbor),
+            Some(&ChunkStreamingState::Generated)
+        );
+    }
+
+    #[test]
+    fn border_air_noop_does_not_mark_adjacent_loaded_chunk_for_remesh() {
+        let mut runtime = EngineRuntime::new_headless(RuntimeConfig {
+            horizontal_view_distance: 0,
+            vertical_view_distance: 0,
+            max_chunk_jobs_per_tick: 1,
+            ..RuntimeConfig::default()
+        });
+        let coord = ChunkCoord::ZERO;
+        let neighbor = coord.offset(1, 0, 0);
+        runtime.world.insert_chunk(Chunk::empty(coord));
+        runtime.world.insert_chunk(Chunk::empty(neighbor));
+
+        runtime.edit_block(VoxelCoord::new(CHUNK_SIZE - 1, 0, 0), BlockState::AIR);
+
+        assert_eq!(
+            runtime.streaming_states.get(&coord),
+            Some(&ChunkStreamingState::Generated)
+        );
+        assert_eq!(runtime.streaming_states.get(&neighbor), None);
+    }
+
+    #[test]
+    fn border_opaque_noop_does_not_mark_adjacent_loaded_chunk_for_remesh() {
+        let mut runtime = EngineRuntime::new_headless(RuntimeConfig {
+            horizontal_view_distance: 0,
+            vertical_view_distance: 0,
+            max_chunk_jobs_per_tick: 1,
+            ..RuntimeConfig::default()
+        });
+        let coord = ChunkCoord::ZERO;
+        let neighbor = coord.offset(1, 0, 0);
+        let voxel = VoxelCoord::new(CHUNK_SIZE - 1, 1, 1);
+        let state = BlockState::new(voxel_core::BlockId::STONE);
+        let mut chunk = Chunk::empty(coord);
+        chunk.set_block(voxel.split_chunk_local().1, state);
+        runtime.world.insert_chunk(chunk);
+        runtime.world.insert_chunk(Chunk::empty(neighbor));
+
+        runtime.edit_block(voxel, state);
+
+        assert_eq!(
+            runtime.streaming_states.get(&coord),
+            Some(&ChunkStreamingState::Generated)
+        );
+        assert_eq!(runtime.streaming_states.get(&neighbor), None);
+    }
+
+    #[test]
+    fn border_edit_reuploads_neighbor_mesh_with_exposed_face() {
+        let coord = ChunkCoord::ZERO;
+        let neighbor = coord.offset(1, 0, 0);
+        let mut left = Chunk::empty(coord);
+        left.set_block(
+            voxel_core::LocalVoxelCoord::new_unchecked((CHUNK_SIZE - 1) as u8, 1, 1),
+            BlockState::new(voxel_core::BlockId::STONE),
+        );
+        let mut right = Chunk::empty(neighbor);
+        right.set_block(
+            voxel_core::LocalVoxelCoord::new_unchecked(0, 1, 1),
+            BlockState::new(voxel_core::BlockId::STONE),
+        );
+
+        let mut runtime = EngineRuntime::with_renderer(
+            RuntimeConfig {
+                max_chunk_jobs_per_tick: 2,
+                max_inflight_chunk_jobs: 2,
+                max_mesh_uploads_per_tick: 2,
+                chunk_worker_threads: 1,
+                ..RuntimeConfig::default()
+            },
+            RecordingRenderer::default(),
+        );
+        runtime.world.insert_chunk(left);
+        runtime.world.insert_chunk(right);
+        runtime
+            .streaming_states
+            .insert(coord, ChunkStreamingState::Generated);
+        runtime
+            .streaming_states
+            .insert(neighbor, ChunkStreamingState::Generated);
+
+        process_selected_chunks(&mut runtime, &[coord, neighbor], 2);
+        assert_eq!(runtime.renderer.quad_counts.get(&neighbor), Some(&5));
+
+        runtime.edit_block(VoxelCoord::new(CHUNK_SIZE - 1, 1, 1), BlockState::AIR);
+        runtime.renderer.quad_counts.remove(&coord);
+        runtime.renderer.quad_counts.remove(&neighbor);
+        process_selected_chunks(&mut runtime, &[coord, neighbor], 2);
+
+        assert_eq!(runtime.renderer.quad_counts.get(&neighbor), Some(&6));
+    }
+
+    #[test]
+    fn edit_during_inflight_mesh_requeues_instead_of_uploading_stale_mesh() {
+        let coord = ChunkCoord::ZERO;
+        let voxel = VoxelCoord::new(1, 1, 1);
+        let mut chunk = Chunk::empty(coord);
+        chunk.set_block(
+            voxel.split_chunk_local().1,
+            BlockState::new(voxel_core::BlockId::STONE),
+        );
+
+        let mut runtime = EngineRuntime::with_renderer(
+            RuntimeConfig {
+                max_chunk_jobs_per_tick: 1,
+                max_inflight_chunk_jobs: 1,
+                max_mesh_uploads_per_tick: 1,
+                chunk_worker_threads: 1,
+                ..RuntimeConfig::default()
+            },
+            RecordingRenderer::default(),
+        );
+        runtime.world.insert_chunk(chunk);
+        runtime
+            .streaming_states
+            .insert(coord, ChunkStreamingState::Generated);
+
+        for _ in 0..100 {
+            runtime.mesh_ready_chunks(&[coord]);
+            if runtime.inflight_mesh_jobs.contains(&coord) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(runtime.inflight_mesh_jobs.contains(&coord));
+
+        runtime.edit_block(voxel, BlockState::AIR);
+        assert!(runtime.dirty_inflight_mesh_jobs.contains(&coord));
+
+        for _ in 0..100 {
+            runtime.collect_mesh_results();
+            if matches!(
+                runtime.streaming_states.get(&coord),
+                Some(ChunkStreamingState::Generated)
+            ) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+
+        assert!(runtime.pending_uploads.is_empty());
+        assert!(!runtime.renderer.quad_counts.contains_key(&coord));
+        assert_eq!(
+            runtime
+                .world
+                .chunks()
+                .get(coord)
+                .unwrap()
+                .block(voxel.split_chunk_local().1),
+            BlockState::AIR
+        );
+
+        process_selected_chunks(&mut runtime, &[coord], 1);
+
+        assert_eq!(runtime.renderer.quad_counts.get(&coord), Some(&0));
     }
 
     #[test]

@@ -221,6 +221,33 @@ struct GpuChunkMesh {
     chunk_coord: ChunkCoord,
 }
 
+enum MeshBufferData<'a> {
+    Borrowed {
+        vertices: &'a [MeshVertex],
+        indices: &'a [u32],
+    },
+    Owned {
+        vertices: Vec<MeshVertex>,
+        indices: Vec<u32>,
+    },
+}
+
+impl<'a> MeshBufferData<'a> {
+    fn vertices(&self) -> &[MeshVertex] {
+        match self {
+            Self::Borrowed { vertices, .. } => vertices,
+            Self::Owned { vertices, .. } => vertices,
+        }
+    }
+
+    fn indices(&self) -> &[u32] {
+        match self {
+            Self::Borrowed { indices, .. } => indices,
+            Self::Owned { indices, .. } => indices,
+        }
+    }
+}
+
 struct OverlayMesh {
     vertex: GpuBuffer,
     index: GpuBuffer,
@@ -862,14 +889,16 @@ impl VulkanRenderer {
         Ok(GpuBuffer { buffer, allocation })
     }
 
-    fn upload_bytes_to_buffer(
+    fn upload_mesh_buffers(
         &self,
-        bytes: &[u8],
-        usage: vk::BufferUsageFlags,
-    ) -> Result<GpuBuffer, VulkanError> {
-        let size = bytes.len().max(1) as vk::DeviceSize;
+        vertex_bytes: &[u8],
+        index_bytes: &[u8],
+    ) -> Result<(GpuBuffer, GpuBuffer), VulkanError> {
+        let vertex_size = vertex_bytes.len() as vk::DeviceSize;
+        let index_size = index_bytes.len() as vk::DeviceSize;
+        let staging_size = vertex_size + index_size;
         let mut staging = self.create_buffer(
-            size,
+            staging_size,
             vk::BufferUsageFlags::TRANSFER_SRC,
             MemoryUsage::AutoPreferHost,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
@@ -877,20 +906,56 @@ impl VulkanRenderer {
         )?;
         unsafe {
             let data = self.allocator()?.map_memory(&mut staging.allocation)?;
-            std::ptr::copy_nonoverlapping(bytes.as_ptr(), data, bytes.len());
+            std::ptr::copy_nonoverlapping(vertex_bytes.as_ptr(), data, vertex_bytes.len());
+            std::ptr::copy_nonoverlapping(
+                index_bytes.as_ptr(),
+                data.add(vertex_bytes.len()),
+                index_bytes.len(),
+            );
             self.allocator()?.unmap_memory(&mut staging.allocation);
         }
 
-        let device_buffer = self.create_buffer(
-            size,
-            usage | vk::BufferUsageFlags::TRANSFER_DST,
+        let vertex = match self.create_buffer(
+            vertex_size,
+            vk::BufferUsageFlags::VERTEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
             MemoryUsage::AutoPreferDevice,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
             AllocationCreateFlags::empty(),
-        )?;
-        self.copy_buffer(staging.buffer, device_buffer.buffer, size)?;
+        ) {
+            Ok(vertex) => vertex,
+            Err(error) => {
+                self.destroy_buffer(staging);
+                return Err(error);
+            }
+        };
+        let index = match self.create_buffer(
+            index_size,
+            vk::BufferUsageFlags::INDEX_BUFFER | vk::BufferUsageFlags::TRANSFER_DST,
+            MemoryUsage::AutoPreferDevice,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+            AllocationCreateFlags::empty(),
+        ) {
+            Ok(index) => index,
+            Err(error) => {
+                self.destroy_buffer(staging);
+                self.destroy_buffer(vertex);
+                return Err(error);
+            }
+        };
+        let copy_result = self.copy_mesh_buffers(
+            staging.buffer,
+            vertex.buffer,
+            index.buffer,
+            vertex_size,
+            index_size,
+        );
         self.destroy_buffer(staging);
-        Ok(device_buffer)
+        if let Err(error) = copy_result {
+            self.destroy_buffer(vertex);
+            self.destroy_buffer(index);
+            return Err(error);
+        }
+        Ok((vertex, index))
     }
 
     fn create_host_buffer_from_bytes(
@@ -945,11 +1010,13 @@ impl VulkanRenderer {
         Ok(())
     }
 
-    fn copy_buffer(
+    fn copy_mesh_buffers(
         &self,
         src: vk::Buffer,
-        dst: vk::Buffer,
-        size: vk::DeviceSize,
+        vertex_dst: vk::Buffer,
+        index_dst: vk::Buffer,
+        vertex_size: vk::DeviceSize,
+        index_size: vk::DeviceSize,
     ) -> Result<(), VulkanError> {
         let device = self.device()?;
         let alloc_info = vk::CommandBufferAllocateInfo::default()
@@ -957,24 +1024,40 @@ impl VulkanRenderer {
             .level(vk::CommandBufferLevel::PRIMARY)
             .command_buffer_count(1);
         let command_buffer = unsafe { device.allocate_command_buffers(&alloc_info)?[0] };
+        let fence_info = vk::FenceCreateInfo::default();
+        let fence = unsafe { device.create_fence(&fence_info, None)? };
         let begin = vk::CommandBufferBeginInfo::default()
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        unsafe {
+        let result = unsafe {
             device.begin_command_buffer(command_buffer, &begin)?;
-            let region = vk::BufferCopy::default().size(size);
-            device.cmd_copy_buffer(command_buffer, src, dst, std::slice::from_ref(&region));
+            let vertex_region = vk::BufferCopy::default().size(vertex_size);
+            device.cmd_copy_buffer(
+                command_buffer,
+                src,
+                vertex_dst,
+                std::slice::from_ref(&vertex_region),
+            );
+            let index_region = vk::BufferCopy::default()
+                .src_offset(vertex_size)
+                .size(index_size);
+            device.cmd_copy_buffer(
+                command_buffer,
+                src,
+                index_dst,
+                std::slice::from_ref(&index_region),
+            );
             device.end_command_buffer(command_buffer)?;
             let submit =
                 vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&command_buffer));
-            device.queue_submit(
-                self.graphics_queue,
-                std::slice::from_ref(&submit),
-                vk::Fence::null(),
-            )?;
-            device.queue_wait_idle(self.graphics_queue)?;
+            device.queue_submit(self.graphics_queue, std::slice::from_ref(&submit), fence)?;
+            device.wait_for_fences(&[fence], true, u64::MAX)?;
+            Ok(())
+        };
+        unsafe {
+            device.destroy_fence(fence, None);
             device.free_command_buffers(self.upload_command_pool, &[command_buffer]);
         }
-        Ok(())
+        result
     }
 
     fn destroy_buffer(&self, mut buffer: GpuBuffer) {
@@ -1227,13 +1310,9 @@ impl RendererBackend for VulkanRenderer {
 
         self.next_mesh_handle += 1;
         let handle = MeshHandle(self.next_mesh_handle);
-        let mut vertices = Vec::new();
-        let mut indices = Vec::new();
-        for surface in &mesh.opaque_surfaces {
-            let base = vertices.len() as u32;
-            vertices.extend_from_slice(&surface.vertices);
-            indices.extend(surface.indices.iter().map(|index| index + base));
-        }
+        let buffers = mesh_buffer_data(mesh);
+        let vertices = buffers.vertices();
+        let indices = buffers.indices();
 
         let gpu_mesh = if indices.is_empty() || vertices.is_empty() {
             GpuChunkMesh {
@@ -1243,12 +1322,9 @@ impl RendererBackend for VulkanRenderer {
                 chunk_coord: mesh.version.chunk,
             }
         } else {
-            let vertex_bytes = bytemuck::cast_slice(&vertices);
-            let index_bytes = bytemuck::cast_slice(&indices);
-            let vertex =
-                self.upload_bytes_to_buffer(vertex_bytes, vk::BufferUsageFlags::VERTEX_BUFFER)?;
-            let index =
-                self.upload_bytes_to_buffer(index_bytes, vk::BufferUsageFlags::INDEX_BUFFER)?;
+            let vertex_bytes = bytemuck::cast_slice(vertices);
+            let index_bytes = bytemuck::cast_slice(indices);
+            let (vertex, index) = self.upload_mesh_buffers(vertex_bytes, index_bytes)?;
             GpuChunkMesh {
                 vertex: Some(vertex),
                 index: Some(index),
@@ -1456,6 +1532,35 @@ impl Drop for VulkanRenderer {
             }
         }
     }
+}
+
+fn mesh_buffer_data(mesh: &ChunkMesh) -> MeshBufferData<'_> {
+    if mesh.opaque_surfaces.len() == 1 {
+        let surface = &mesh.opaque_surfaces[0];
+        return MeshBufferData::Borrowed {
+            vertices: &surface.vertices,
+            indices: &surface.indices,
+        };
+    }
+
+    let vertex_count = mesh
+        .opaque_surfaces
+        .iter()
+        .map(|surface| surface.vertices.len())
+        .sum();
+    let index_count = mesh
+        .opaque_surfaces
+        .iter()
+        .map(|surface| surface.indices.len())
+        .sum();
+    let mut vertices = Vec::with_capacity(vertex_count);
+    let mut indices = Vec::with_capacity(index_count);
+    for surface in &mesh.opaque_surfaces {
+        let base = vertices.len() as u32;
+        vertices.extend_from_slice(&surface.vertices);
+        indices.extend(surface.indices.iter().map(|index| index + base));
+    }
+    MeshBufferData::Owned { vertices, indices }
 }
 
 fn create_instance(

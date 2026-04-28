@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::Arc};
 use voxel_core::{
-    BlockId, BlockState, CHUNK_SIZE, CHUNK_SIZE_USIZE, CHUNK_VOLUME, ChunkCoord, LocalVoxelCoord,
-    RegionCoord, VoxelCoord,
+    BlockId, BlockState, CHUNK_AREA, CHUNK_SIZE, CHUNK_SIZE_USIZE, CHUNK_VOLUME, ChunkCoord,
+    LocalVoxelCoord, RegionCoord, VoxelCoord,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -73,6 +73,10 @@ impl Default for BlockRegistry {
 }
 
 impl BlockRegistry {
+    pub fn materials(&self) -> &[BlockMaterial] {
+        &self.materials
+    }
+
     pub fn material(&self, id: BlockId) -> Option<&BlockMaterial> {
         self.materials.iter().find(|material| material.id == id)
     }
@@ -210,13 +214,13 @@ impl WorldGenerator for TerrainGenerator {
     fn generate_chunk(&self, coord: ChunkCoord) -> Chunk {
         let mut chunk = Chunk::empty(coord);
         let origin = coord.min_voxel();
-        for y in 0..CHUNK_SIZE {
-            for z in 0..CHUNK_SIZE {
-                for x in 0..CHUNK_SIZE {
-                    let world_x = origin.x + x;
+        for z in 0..CHUNK_SIZE {
+            for x in 0..CHUNK_SIZE {
+                let world_x = origin.x + x;
+                let world_z = origin.z + z;
+                let height = self.height_at(world_x, world_z);
+                for y in 0..CHUNK_SIZE {
                     let world_y = origin.y + y;
-                    let world_z = origin.z + z;
-                    let height = self.height_at(world_x, world_z);
                     let state = if world_y > height {
                         BlockState::AIR
                     } else if world_y == height {
@@ -226,10 +230,9 @@ impl WorldGenerator for TerrainGenerator {
                     } else {
                         BlockState::new(BlockId::STONE)
                     };
-                    chunk.set_block(
-                        LocalVoxelCoord::new_unchecked(x as u8, y as u8, z as u8),
-                        state,
-                    );
+                    let index =
+                        (y as usize * CHUNK_AREA) + (z as usize * CHUNK_SIZE_USIZE) + x as usize;
+                    chunk.blocks[index] = state;
                 }
             }
         }
@@ -244,14 +247,15 @@ pub fn compute_basic_skylight(chunk: &mut Chunk) {
         for z in 0..CHUNK_SIZE_USIZE {
             let mut light = 15;
             for y in (0..CHUNK_SIZE_USIZE).rev() {
-                let local = LocalVoxelCoord::new_unchecked(x as u8, y as u8, z as u8);
-                if !chunk.block(local).is_air() {
+                let index = (y * CHUNK_AREA) + (z * CHUNK_SIZE_USIZE) + x;
+                if !chunk.blocks[index].is_air() {
                     light = 0;
                 }
-                chunk.light_mut().set_skylight(local, light);
+                chunk.light.skylight[index] = light;
             }
         }
     }
+    chunk.dirty = true;
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -303,24 +307,33 @@ impl EditLogStore for InMemoryEditLogStore {
 
 #[derive(Default)]
 pub struct ChunkStore {
-    chunks: HashMap<ChunkCoord, Chunk>,
+    chunks: HashMap<ChunkCoord, Arc<Chunk>>,
 }
 
 impl ChunkStore {
     pub fn insert(&mut self, chunk: Chunk) {
-        self.chunks.insert(chunk.coord(), chunk);
+        self.chunks.insert(chunk.coord(), Arc::new(chunk));
     }
 
     pub fn remove(&mut self, coord: ChunkCoord) -> Option<Chunk> {
-        self.chunks.remove(&coord)
+        self.chunks
+            .remove(&coord)
+            .map(|chunk| match Arc::try_unwrap(chunk) {
+                Ok(chunk) => chunk,
+                Err(shared) => (*shared).clone(),
+            })
     }
 
     pub fn get(&self, coord: ChunkCoord) -> Option<&Chunk> {
-        self.chunks.get(&coord)
+        self.chunks.get(&coord).map(Arc::as_ref)
+    }
+
+    pub fn get_arc(&self, coord: ChunkCoord) -> Option<Arc<Chunk>> {
+        self.chunks.get(&coord).cloned()
     }
 
     pub fn get_mut(&mut self, coord: ChunkCoord) -> Option<&mut Chunk> {
-        self.chunks.get_mut(&coord)
+        self.chunks.get_mut(&coord).map(Arc::make_mut)
     }
 
     pub fn len(&self) -> usize {
