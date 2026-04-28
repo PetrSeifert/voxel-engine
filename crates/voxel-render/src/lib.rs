@@ -143,7 +143,7 @@ impl RenderScene {
             ResidentChunkMesh {
                 handle,
                 version: mesh.version,
-                quad_count: mesh.opaque_quad_count(),
+                quad_count: mesh.quad_count(),
             },
         );
         self.stats.resident_chunks = self.chunk_meshes.len();

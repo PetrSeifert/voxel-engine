@@ -432,6 +432,7 @@ fn chunk_boundary_has_opaque(
 fn mesh_upload_bytes(mesh: &ChunkMesh) -> u64 {
     mesh.opaque_surfaces
         .iter()
+        .chain(mesh.transparent_surfaces.iter())
         .map(|surface| {
             surface.vertices.len() * std::mem::size_of::<voxel_mesh::MeshVertex>()
                 + surface.indices.len() * std::mem::size_of::<u32>()
@@ -761,16 +762,17 @@ impl<R: RendererBackend> EngineRuntime<R> {
             return;
         };
 
-        let remesh_direction_mask = Direction::ALL
-            .iter()
-            .enumerate()
-            .fold(0u8, |mask, (index, &direction)| {
-                if chunk_boundary_has_opaque(chunk, direction, &self.block_registry) {
-                    mask | (1u8 << index)
-                } else {
-                    mask
-                }
-            });
+        let remesh_direction_mask =
+            Direction::ALL
+                .iter()
+                .enumerate()
+                .fold(0u8, |mask, (index, &direction)| {
+                    if chunk_boundary_has_opaque(chunk, direction, &self.block_registry) {
+                        mask | (1u8 << index)
+                    } else {
+                        mask
+                    }
+                });
 
         for (index, direction) in Direction::ALL.iter().copied().enumerate() {
             if remesh_direction_mask & (1u8 << index) == 0 {
@@ -1035,7 +1037,7 @@ mod tests {
         fn upload_chunk_mesh(&mut self, mesh: &ChunkMesh) -> Result<MeshHandle, RenderError> {
             self.next_handle += 1;
             self.quad_counts
-                .insert(mesh.version.chunk, mesh.opaque_quad_count());
+                .insert(mesh.version.chunk, mesh.quad_count());
             Ok(MeshHandle(self.next_handle))
         }
 

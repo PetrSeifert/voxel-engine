@@ -72,8 +72,8 @@ impl Default for VulkanRendererConfig {
 pub enum VulkanError {
     #[error("failed to load Vulkan entry: {0}")]
     EntryLoad(#[from] ash::LoadingError),
-    #[error("window handle error: {0}")]
-    WindowHandle(#[from] raw_window_handle::HandleError),
+    #[error("window handle error: {0:?}")]
+    WindowHandle(raw_window_handle::HandleError),
     #[error("Vulkan error: {0:?}")]
     Vk(#[from] vk::Result),
     #[error("Vulkan backend is not initialized: {0}")]
@@ -91,6 +91,12 @@ pub enum VulkanError {
 impl From<VulkanError> for RenderError {
     fn from(value: VulkanError) -> Self {
         RenderError::Backend(value.to_string())
+    }
+}
+
+impl From<raw_window_handle::HandleError> for VulkanError {
+    fn from(value: raw_window_handle::HandleError) -> Self {
+        Self::WindowHandle(value)
     }
 }
 
@@ -217,7 +223,8 @@ struct GpuImage {
 struct GpuChunkMesh {
     vertex: Option<GpuBuffer>,
     index: Option<GpuBuffer>,
-    index_count: u32,
+    opaque_index_count: u32,
+    transparent_index_count: u32,
     chunk_coord: ChunkCoord,
 }
 
@@ -225,10 +232,14 @@ enum MeshBufferData<'a> {
     Borrowed {
         vertices: &'a [MeshVertex],
         indices: &'a [u32],
+        opaque_index_count: usize,
+        transparent_index_count: usize,
     },
     Owned {
         vertices: Vec<MeshVertex>,
         indices: Vec<u32>,
+        opaque_index_count: usize,
+        transparent_index_count: usize,
     },
 }
 
@@ -244,6 +255,30 @@ impl<'a> MeshBufferData<'a> {
         match self {
             Self::Borrowed { indices, .. } => indices,
             Self::Owned { indices, .. } => indices,
+        }
+    }
+
+    fn opaque_index_count(&self) -> usize {
+        match self {
+            Self::Borrowed {
+                opaque_index_count, ..
+            }
+            | Self::Owned {
+                opaque_index_count, ..
+            } => *opaque_index_count,
+        }
+    }
+
+    fn transparent_index_count(&self) -> usize {
+        match self {
+            Self::Borrowed {
+                transparent_index_count,
+                ..
+            }
+            | Self::Owned {
+                transparent_index_count,
+                ..
+            } => *transparent_index_count,
         }
     }
 }
@@ -309,6 +344,7 @@ pub struct VulkanRenderer {
     swapchain: Option<SwapchainState>,
     pipeline_layout: vk::PipelineLayout,
     pipeline: vk::Pipeline,
+    transparent_pipeline: vk::Pipeline,
     overlay_pipeline_layout: vk::PipelineLayout,
     overlay_pipeline: vk::Pipeline,
     meshes: HashMap<MeshHandle, GpuChunkMesh>,
@@ -343,6 +379,7 @@ impl VulkanRenderer {
             swapchain: None,
             pipeline_layout: vk::PipelineLayout::null(),
             pipeline: vk::Pipeline::null(),
+            transparent_pipeline: vk::Pipeline::null(),
             overlay_pipeline_layout: vk::PipelineLayout::null(),
             overlay_pipeline: vk::Pipeline::null(),
             meshes: HashMap::new(),
@@ -615,6 +652,11 @@ impl VulkanRenderer {
                 self.device()?.destroy_pipeline(self.pipeline, None);
                 self.pipeline = vk::Pipeline::null();
             }
+            if self.transparent_pipeline != vk::Pipeline::null() {
+                self.device()?
+                    .destroy_pipeline(self.transparent_pipeline, None);
+                self.transparent_pipeline = vk::Pipeline::null();
+            }
             if self.pipeline_layout != vk::PipelineLayout::null() {
                 self.device()?
                     .destroy_pipeline_layout(self.pipeline_layout, None);
@@ -631,6 +673,33 @@ impl VulkanRenderer {
             }
         }
 
+        let device = self.device()?;
+        let push_range = vk::PushConstantRange::default()
+            .stage_flags(vk::ShaderStageFlags::VERTEX)
+            .offset(0)
+            .size(std::mem::size_of::<PushConstants>() as u32);
+        let layout_info = vk::PipelineLayoutCreateInfo::default()
+            .push_constant_ranges(std::slice::from_ref(&push_range));
+        let pipeline_layout = unsafe { device.create_pipeline_layout(&layout_info, None)? };
+        let pipeline = self.create_chunk_pipeline(color_format, pipeline_layout, false)?;
+        let transparent_pipeline =
+            self.create_chunk_pipeline(color_format, pipeline_layout, true)?;
+        self.pipeline_layout = pipeline_layout;
+        self.pipeline = pipeline;
+        self.transparent_pipeline = transparent_pipeline;
+        let (overlay_pipeline_layout, overlay_pipeline) =
+            self.create_overlay_pipeline(color_format)?;
+        self.overlay_pipeline_layout = overlay_pipeline_layout;
+        self.overlay_pipeline = overlay_pipeline;
+        Ok(())
+    }
+
+    fn create_chunk_pipeline(
+        &self,
+        color_format: vk::Format,
+        pipeline_layout: vk::PipelineLayout,
+        transparent: bool,
+    ) -> Result<vk::Pipeline, VulkanError> {
         let device = self.device()?;
         let vert_shader = create_shader_module(device, CHUNK_VERT_SPV)?;
         let frag_shader = create_shader_module(device, CHUNK_FRAG_SPV)?;
@@ -701,9 +770,9 @@ impl VulkanRenderer {
             .rasterization_samples(vk::SampleCountFlags::TYPE_1);
         let depth = vk::PipelineDepthStencilStateCreateInfo::default()
             .depth_test_enable(true)
-            .depth_write_enable(true)
+            .depth_write_enable(!transparent)
             .depth_compare_op(vk::CompareOp::LESS);
-        let color_blend_attachment = vk::PipelineColorBlendAttachmentState::default()
+        let mut color_blend_attachment = vk::PipelineColorBlendAttachmentState::default()
             .color_write_mask(
                 vk::ColorComponentFlags::R
                     | vk::ColorComponentFlags::G
@@ -711,17 +780,20 @@ impl VulkanRenderer {
                     | vk::ColorComponentFlags::A,
             )
             .blend_enable(false);
+        if transparent {
+            color_blend_attachment = color_blend_attachment
+                .blend_enable(true)
+                .src_color_blend_factor(vk::BlendFactor::SRC_ALPHA)
+                .dst_color_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                .color_blend_op(vk::BlendOp::ADD)
+                .src_alpha_blend_factor(vk::BlendFactor::ONE)
+                .dst_alpha_blend_factor(vk::BlendFactor::ONE_MINUS_SRC_ALPHA)
+                .alpha_blend_op(vk::BlendOp::ADD);
+        }
         let color_blend = vk::PipelineColorBlendStateCreateInfo::default()
             .attachments(std::slice::from_ref(&color_blend_attachment));
         let dynamic_states = [vk::DynamicState::VIEWPORT, vk::DynamicState::SCISSOR];
         let dynamic = vk::PipelineDynamicStateCreateInfo::default().dynamic_states(&dynamic_states);
-        let push_range = vk::PushConstantRange::default()
-            .stage_flags(vk::ShaderStageFlags::VERTEX)
-            .offset(0)
-            .size(std::mem::size_of::<PushConstants>() as u32);
-        let layout_info = vk::PipelineLayoutCreateInfo::default()
-            .push_constant_ranges(std::slice::from_ref(&push_range));
-        let pipeline_layout = unsafe { device.create_pipeline_layout(&layout_info, None)? };
 
         let color_formats = [color_format];
         let mut rendering = vk::PipelineRenderingCreateInfo::default()
@@ -750,13 +822,7 @@ impl VulkanRenderer {
             device.destroy_shader_module(vert_shader, None);
             device.destroy_shader_module(frag_shader, None);
         }
-        self.pipeline_layout = pipeline_layout;
-        self.pipeline = pipeline;
-        let (overlay_pipeline_layout, overlay_pipeline) =
-            self.create_overlay_pipeline(color_format)?;
-        self.overlay_pipeline_layout = overlay_pipeline_layout;
-        self.overlay_pipeline = overlay_pipeline;
-        Ok(())
+        Ok(pipeline)
     }
 
     fn create_overlay_pipeline(
@@ -1192,12 +1258,26 @@ impl VulkanRenderer {
             let mut projection = scene.camera.projection_matrix(aspect);
             projection.y_axis.y *= -1.0;
             let view_proj = projection * scene.camera.view_matrix();
+            let mut transparent_residents: Vec<_> = scene.chunk_meshes.values().collect();
+            transparent_residents.sort_by(|a, b| {
+                let a_distance = self
+                    .meshes
+                    .get(&a.handle)
+                    .map(|mesh| chunk_center_distance2(mesh.chunk_coord, scene.camera.position))
+                    .unwrap_or(0.0);
+                let b_distance = self
+                    .meshes
+                    .get(&b.handle)
+                    .map(|mesh| chunk_center_distance2(mesh.chunk_coord, scene.camera.position))
+                    .unwrap_or(0.0);
+                b_distance.total_cmp(&a_distance)
+            });
 
             for resident in scene.chunk_meshes.values() {
                 let Some(mesh) = self.meshes.get(&resident.handle) else {
                     continue;
                 };
-                if mesh.index_count == 0 {
+                if mesh.opaque_index_count == 0 {
                     continue;
                 }
                 let Some(vertex) = &mesh.vertex else {
@@ -1225,7 +1305,55 @@ impl VulkanRenderer {
                     0,
                     vk::IndexType::UINT32,
                 );
-                device.cmd_draw_indexed(command_buffer, mesh.index_count, 1, 0, 0, 0);
+                device.cmd_draw_indexed(command_buffer, mesh.opaque_index_count, 1, 0, 0, 0);
+            }
+
+            device.cmd_bind_pipeline(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.transparent_pipeline,
+            );
+
+            for resident in transparent_residents {
+                let Some(mesh) = self.meshes.get(&resident.handle) else {
+                    continue;
+                };
+                if mesh.transparent_index_count == 0 {
+                    continue;
+                }
+                let Some(vertex) = &mesh.vertex else {
+                    continue;
+                };
+                let Some(index) = &mesh.index else {
+                    continue;
+                };
+                let origin = chunk_origin(mesh.chunk_coord);
+                let push = PushConstants {
+                    view_proj: view_proj.to_cols_array_2d(),
+                    chunk_origin: [origin[0], origin[1], origin[2], 0.0],
+                };
+                device.cmd_push_constants(
+                    command_buffer,
+                    self.pipeline_layout,
+                    vk::ShaderStageFlags::VERTEX,
+                    0,
+                    bytemuck::bytes_of(&push),
+                );
+                device.cmd_bind_vertex_buffers(command_buffer, 0, &[vertex.buffer], &[0]);
+                device.cmd_bind_index_buffer(
+                    command_buffer,
+                    index.buffer,
+                    0,
+                    vk::IndexType::UINT32,
+                );
+                device.cmd_draw_indexed(
+                    command_buffer,
+                    mesh.transparent_index_count,
+                    1,
+                    mesh.opaque_index_count,
+                    0,
+                    0,
+                );
             }
 
             if let Some((vertex_buffer, index_buffer, index_count)) = overlay_draw {
@@ -1280,6 +1408,12 @@ impl VulkanRenderer {
                 self.device().unwrap().destroy_pipeline(self.pipeline, None);
                 self.pipeline = vk::Pipeline::null();
             }
+            if self.transparent_pipeline != vk::Pipeline::null() {
+                self.device()
+                    .unwrap()
+                    .destroy_pipeline(self.transparent_pipeline, None);
+                self.transparent_pipeline = vk::Pipeline::null();
+            }
             if self.pipeline_layout != vk::PipelineLayout::null() {
                 self.device()
                     .unwrap()
@@ -1313,12 +1447,15 @@ impl RendererBackend for VulkanRenderer {
         let buffers = mesh_buffer_data(mesh);
         let vertices = buffers.vertices();
         let indices = buffers.indices();
+        let opaque_index_count = buffers.opaque_index_count() as u32;
+        let transparent_index_count = buffers.transparent_index_count() as u32;
 
         let gpu_mesh = if indices.is_empty() || vertices.is_empty() {
             GpuChunkMesh {
                 vertex: None,
                 index: None,
-                index_count: 0,
+                opaque_index_count: 0,
+                transparent_index_count: 0,
                 chunk_coord: mesh.version.chunk,
             }
         } else {
@@ -1328,7 +1465,8 @@ impl RendererBackend for VulkanRenderer {
             GpuChunkMesh {
                 vertex: Some(vertex),
                 index: Some(index),
-                index_count: indices.len() as u32,
+                opaque_index_count,
+                transparent_index_count,
                 chunk_coord: mesh.version.chunk,
             }
         };
@@ -1535,32 +1673,56 @@ impl Drop for VulkanRenderer {
 }
 
 fn mesh_buffer_data(mesh: &ChunkMesh) -> MeshBufferData<'_> {
-    if mesh.opaque_surfaces.len() == 1 {
+    let opaque_index_count: usize = mesh
+        .opaque_surfaces
+        .iter()
+        .map(|surface| surface.indices.len())
+        .sum();
+    let transparent_index_count: usize = mesh
+        .transparent_surfaces
+        .iter()
+        .map(|surface| surface.indices.len())
+        .sum();
+
+    if mesh.opaque_surfaces.len() == 1 && transparent_index_count == 0 {
         let surface = &mesh.opaque_surfaces[0];
         return MeshBufferData::Borrowed {
             vertices: &surface.vertices,
             indices: &surface.indices,
+            opaque_index_count,
+            transparent_index_count,
         };
     }
 
     let vertex_count = mesh
         .opaque_surfaces
         .iter()
+        .chain(mesh.transparent_surfaces.iter())
         .map(|surface| surface.vertices.len())
         .sum();
     let index_count = mesh
         .opaque_surfaces
         .iter()
+        .chain(mesh.transparent_surfaces.iter())
         .map(|surface| surface.indices.len())
         .sum();
     let mut vertices = Vec::with_capacity(vertex_count);
     let mut indices = Vec::with_capacity(index_count);
-    for surface in &mesh.opaque_surfaces {
+    for surface in mesh
+        .opaque_surfaces
+        .iter()
+        .chain(mesh.transparent_surfaces.iter())
+    {
         let base = vertices.len() as u32;
         vertices.extend_from_slice(&surface.vertices);
         indices.extend(surface.indices.iter().map(|index| index + base));
     }
-    MeshBufferData::Owned { vertices, indices }
+    MeshBufferData::Owned {
+        vertices,
+        indices,
+        opaque_index_count,
+        transparent_index_count,
+    }
 }
 
 fn create_instance(
@@ -1942,6 +2104,13 @@ fn chunk_origin(coord: ChunkCoord) -> [f32; 3] {
     ]
 }
 
+fn chunk_center_distance2(coord: ChunkCoord, position: glam::Vec3) -> f32 {
+    let origin = chunk_origin(coord);
+    let half = CHUNK_SIZE as f32 * 0.5;
+    let center = glam::Vec3::new(origin[0] + half, origin[1] + half, origin[2] + half);
+    center.distance_squared(position)
+}
+
 fn build_debug_overlay(
     scene: &RenderScene,
     extent: vk::Extent2D,
@@ -2270,6 +2439,20 @@ mod tests {
             VulkanRenderer::estimate_mesh_upload_bytes(&mesh),
             (4 * std::mem::size_of::<MeshVertex>() + 6 * std::mem::size_of::<u32>()) as u64
         );
+    }
+
+    #[test]
+    fn mesh_buffer_data_keeps_transparent_indices_after_opaque_indices() {
+        let mut mesh = ChunkMesh::empty(ChunkCoord::ZERO, 0);
+        mesh.opaque_surfaces[0].vertices = vec![MeshVertex::zeroed(); 4];
+        mesh.opaque_surfaces[0].indices = vec![0, 1, 2, 0, 2, 3];
+        mesh.transparent_surfaces[0].vertices = vec![MeshVertex::zeroed(); 4];
+        mesh.transparent_surfaces[0].indices = vec![0, 1, 2, 0, 2, 3];
+
+        let buffers = mesh_buffer_data(&mesh);
+        assert_eq!(buffers.opaque_index_count(), 6);
+        assert_eq!(buffers.transparent_index_count(), 6);
+        assert_eq!(buffers.indices(), &[0, 1, 2, 0, 2, 3, 4, 5, 6, 4, 6, 7]);
     }
 
     #[test]

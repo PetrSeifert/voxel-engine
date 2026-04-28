@@ -21,6 +21,10 @@ impl BlockId {
     pub const DIRT: Self = Self(2);
     pub const GRASS: Self = Self(3);
     pub const WATER: Self = Self(4);
+    pub const SAND: Self = Self(5);
+    pub const WOOD: Self = Self(6);
+    pub const LEAVES: Self = Self(7);
+    pub const SNOW: Self = Self(8);
 
     pub const fn is_air(self) -> bool {
         self.0 == Self::AIR.0

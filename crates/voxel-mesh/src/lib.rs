@@ -83,7 +83,7 @@ impl ChunkMesh {
     pub fn empty(chunk: ChunkCoord, version: u64) -> Self {
         Self {
             opaque_surfaces: vec![MeshSurface::default()],
-            transparent_surfaces: Vec::new(),
+            transparent_surfaces: vec![MeshSurface::default()],
             bounds: AabbI32::chunk_bounds(chunk),
             version: MeshVersion { chunk, version },
         }
@@ -94,6 +94,17 @@ impl ChunkMesh {
             .iter()
             .map(MeshSurface::quad_count)
             .sum()
+    }
+
+    pub fn transparent_quad_count(&self) -> usize {
+        self.transparent_surfaces
+            .iter()
+            .map(MeshSurface::quad_count)
+            .sum()
+    }
+
+    pub fn quad_count(&self) -> usize {
+        self.opaque_quad_count() + self.transparent_quad_count()
     }
 }
 
@@ -107,23 +118,42 @@ pub fn mesh_chunk_greedy_with_neighbors(
     neighbors: ChunkNeighbors<'_>,
 ) -> ChunkMesh {
     let mut mesh = ChunkMesh::empty(chunk.coord(), chunk.version());
-    let surface = mesh
+    let opaque_surface = mesh
         .opaque_surfaces
         .first_mut()
         .expect("empty mesh creates one opaque surface");
+    let transparent_surface = mesh
+        .transparent_surfaces
+        .first_mut()
+        .expect("empty mesh creates one transparent surface");
     // One unmerged quad per cell on each chunk side; interior cavities can grow beyond this.
-    surface
+    opaque_surface
         .vertices
         .reserve(SURFACE_QUAD_RESERVE * VERTICES_PER_QUAD);
-    surface
+    opaque_surface
+        .indices
+        .reserve(SURFACE_QUAD_RESERVE * INDICES_PER_QUAD);
+    transparent_surface
+        .vertices
+        .reserve(SURFACE_QUAD_RESERVE * VERTICES_PER_QUAD);
+    transparent_surface
         .indices
         .reserve(SURFACE_QUAD_RESERVE * INDICES_PER_QUAD);
 
     let opacity = opacity_table(registry);
+    let visibility = visibility_table(registry);
     let blocks = chunk.blocks();
 
     for direction in Direction::ALL {
-        mesh_direction(blocks, neighbors, &opacity, direction, surface);
+        mesh_direction(
+            blocks,
+            neighbors,
+            &opacity,
+            &visibility,
+            direction,
+            opaque_surface,
+            transparent_surface,
+        );
     }
 
     mesh
@@ -133,16 +163,20 @@ fn mesh_direction(
     blocks: &[BlockState],
     neighbors: ChunkNeighbors<'_>,
     opacity: &[bool],
+    visibility: &[bool],
     direction: Direction,
-    surface: &mut MeshSurface,
+    opaque_surface: &mut MeshSurface,
+    transparent_surface: &mut MeshSurface,
 ) {
     let axis = normal_axis(direction);
     let u_axis = (axis + 1) % 3;
     let v_axis = (axis + 2) % 3;
-    let mut mask = vec![None; CHUNK_AREA];
+    let mut opaque_mask = vec![None; CHUNK_AREA];
+    let mut transparent_mask = vec![None; CHUNK_AREA];
 
     for slice in 0..CHUNK_SIZE_USIZE {
-        mask.fill(None);
+        opaque_mask.fill(None);
+        transparent_mask.fill(None);
         for v in 0..CHUNK_SIZE_USIZE {
             for u in 0..CHUNK_SIZE_USIZE {
                 let mut coord = [0usize; 3];
@@ -151,22 +185,50 @@ fn mesh_direction(
                 coord[v_axis] = v;
 
                 let state = block_at(blocks, coord);
-                if !is_opaque(state, opacity) {
+                if !is_visible(state, visibility) {
                     continue;
                 }
 
-                if face_is_visible(blocks, neighbors, opacity, coord, direction) {
-                    let ao = face_ao(blocks, neighbors, opacity, coord, direction);
-                    mask[v * CHUNK_SIZE_USIZE + u] = Some(FaceKey {
+                if face_is_visible(blocks, neighbors, opacity, visibility, coord, direction) {
+                    let state_opaque = is_opaque(state, opacity);
+                    let ao = if state_opaque {
+                        face_ao(blocks, neighbors, opacity, coord, direction)
+                    } else {
+                        0
+                    };
+                    let key = FaceKey {
                         material: state.id,
                         direction,
                         ao,
-                    });
+                    };
+                    let mask = if state_opaque {
+                        &mut opaque_mask
+                    } else {
+                        &mut transparent_mask
+                    };
+                    mask[v * CHUNK_SIZE_USIZE + u] = Some(key);
                 }
             }
         }
 
-        emit_greedy_mask(surface, &mut mask, axis, u_axis, v_axis, slice, direction);
+        emit_greedy_mask(
+            opaque_surface,
+            &mut opaque_mask,
+            axis,
+            u_axis,
+            v_axis,
+            slice,
+            direction,
+        );
+        emit_greedy_mask(
+            transparent_surface,
+            &mut transparent_mask,
+            axis,
+            u_axis,
+            v_axis,
+            slice,
+            direction,
+        );
     }
 }
 
@@ -184,8 +246,29 @@ fn opacity_table(registry: &BlockRegistry) -> Vec<bool> {
     opacity
 }
 
+fn visibility_table(registry: &BlockRegistry) -> Vec<bool> {
+    let max_id = registry
+        .materials()
+        .iter()
+        .map(|material| material.id.0 as usize)
+        .max()
+        .unwrap_or(0);
+    let mut visibility = vec![false; max_id + 1];
+    for material in registry.materials() {
+        visibility[material.id.0 as usize] = !material.id.is_air();
+    }
+    visibility
+}
+
 fn is_opaque(state: BlockState, opacity: &[bool]) -> bool {
     opacity.get(state.id.0 as usize).copied().unwrap_or(false)
+}
+
+fn is_visible(state: BlockState, visibility: &[bool]) -> bool {
+    visibility
+        .get(state.id.0 as usize)
+        .copied()
+        .unwrap_or(!state.is_air())
 }
 
 fn block_index(x: usize, y: usize, z: usize) -> usize {
@@ -336,9 +419,11 @@ fn face_is_visible(
     blocks: &[BlockState],
     neighbors: ChunkNeighbors<'_>,
     opacity: &[bool],
+    visibility: &[bool],
     coord: [usize; 3],
     direction: Direction,
 ) -> bool {
+    let state = block_at(blocks, coord);
     let axis = normal_axis(direction);
     let neighbor_axis = if is_positive(direction) {
         coord[axis].checked_add(1)
@@ -347,20 +432,22 @@ fn face_is_visible(
     };
 
     let Some(neighbor_axis) = neighbor_axis else {
-        return neighbor_face_is_visible(neighbors, opacity, coord, direction);
+        return neighbor_face_is_visible(state, neighbors, opacity, visibility, coord, direction);
     };
     if neighbor_axis < CHUNK_SIZE_USIZE {
         let mut neighbor = coord;
         neighbor[axis] = neighbor_axis;
-        return !is_opaque(block_at(blocks, neighbor), opacity);
+        return face_visible_against(state, block_at(blocks, neighbor), opacity, visibility);
     }
 
-    neighbor_face_is_visible(neighbors, opacity, coord, direction)
+    neighbor_face_is_visible(state, neighbors, opacity, visibility, coord, direction)
 }
 
 fn neighbor_face_is_visible(
+    state: BlockState,
     neighbors: ChunkNeighbors<'_>,
     opacity: &[bool],
+    visibility: &[bool],
     coord: [usize; 3],
     direction: Direction,
 ) -> bool {
@@ -376,7 +463,35 @@ fn neighbor_face_is_visible(
         Direction::NegZ => [x, y, CHUNK_SIZE_USIZE - 1],
         Direction::PosZ => [x, y, 0],
     };
-    !is_opaque(block_at(neighbor.blocks(), neighbor_coord), opacity)
+    face_visible_against(
+        state,
+        block_at(neighbor.blocks(), neighbor_coord),
+        opacity,
+        visibility,
+    )
+}
+
+fn face_visible_against(
+    state: BlockState,
+    neighbor: BlockState,
+    opacity: &[bool],
+    visibility: &[bool],
+) -> bool {
+    if !is_visible(neighbor, visibility) {
+        return true;
+    }
+    if state.id == neighbor.id {
+        return false;
+    }
+    let state_opaque = is_opaque(state, opacity);
+    let neighbor_opaque = is_opaque(neighbor, opacity);
+    if state_opaque != neighbor_opaque {
+        return true;
+    }
+    if !state_opaque && !neighbor_opaque {
+        return state.id.0 < neighbor.id.0;
+    }
+    false
 }
 
 fn face_ao(
@@ -387,16 +502,22 @@ fn face_ao(
     direction: Direction,
 ) -> u8 {
     let axis = normal_axis(direction);
+    let normal = direction.normal();
     let mut samples = 0;
     let mut occluders = 0;
     for delta_v in [-1isize, 1] {
         for delta_u in [-1isize, 1] {
             let mut sample = [coord[0] as isize, coord[1] as isize, coord[2] as isize];
+            if direction == Direction::PosY {
+                sample[axis] += normal[axis] as isize;
+            }
             let u_axis = (axis + 1) % 3;
             let v_axis = (axis + 2) % 3;
             sample[u_axis] += delta_u;
             sample[v_axis] += delta_v;
-            let Some(sample) = sample_ao_block(blocks, neighbors, sample) else {
+            let Some(sample) =
+                sample_ao_block(blocks, neighbors, sample, direction != Direction::PosY)
+            else {
                 continue;
             };
             samples += 1;
@@ -431,6 +552,7 @@ fn sample_ao_block(
     blocks: &[BlockState],
     neighbors: ChunkNeighbors<'_>,
     sample: [isize; 3],
+    missing_corner_occludes: bool,
 ) -> Option<AoSample> {
     let mut local = [0usize; 3];
     let mut out_axis = None;
@@ -443,7 +565,7 @@ fn sample_ao_block(
             return None;
         }
         if out_axis.replace(axis).is_some() {
-            return Some(AoSample::Occluder);
+            return missing_corner_occludes.then_some(AoSample::Occluder);
         }
         local[axis] = if sample[axis] < 0 {
             CHUNK_SIZE_USIZE - 1
@@ -583,6 +705,54 @@ mod tests {
     }
 
     #[test]
+    fn water_block_emits_visible_faces_while_non_opaque() {
+        let registry = BlockRegistry::default();
+        assert!(!registry.is_opaque(BlockState::new(BlockId::WATER)));
+
+        let mut chunk = Chunk::empty(ChunkCoord::ZERO);
+        chunk.set_block(
+            LocalVoxelCoord::new_unchecked(1, 1, 1),
+            BlockState::new(BlockId::WATER),
+        );
+        let mesh = mesh_chunk_greedy(&chunk, &registry);
+        assert_eq!(mesh.opaque_quad_count(), 0);
+        assert_eq!(mesh.transparent_quad_count(), 6);
+    }
+
+    #[test]
+    fn leaves_emit_visible_faces_while_non_opaque() {
+        let registry = BlockRegistry::default();
+        assert!(!registry.is_opaque(BlockState::new(BlockId::LEAVES)));
+
+        let mut chunk = Chunk::empty(ChunkCoord::ZERO);
+        chunk.set_block(
+            LocalVoxelCoord::new_unchecked(1, 1, 1),
+            BlockState::new(BlockId::LEAVES),
+        );
+        let mesh = mesh_chunk_greedy(&chunk, &registry);
+        assert_eq!(mesh.opaque_quad_count(), 0);
+        assert_eq!(mesh.transparent_quad_count(), 6);
+    }
+
+    #[test]
+    fn adjacent_water_blocks_do_not_emit_internal_faces() {
+        let registry = BlockRegistry::default();
+        let mut chunk = Chunk::empty(ChunkCoord::ZERO);
+        chunk.set_block(
+            LocalVoxelCoord::new_unchecked(1, 1, 1),
+            BlockState::new(BlockId::WATER),
+        );
+        chunk.set_block(
+            LocalVoxelCoord::new_unchecked(2, 1, 1),
+            BlockState::new(BlockId::WATER),
+        );
+
+        let mesh = mesh_chunk_greedy(&chunk, &registry);
+        assert_eq!(mesh.opaque_quad_count(), 0);
+        assert_eq!(mesh.transparent_quad_count(), 6);
+    }
+
+    #[test]
     fn edge_ao_samples_cardinal_neighbor_chunks() {
         let mut chunk = Chunk::empty(ChunkCoord::ZERO);
         chunk.set_block(
@@ -637,6 +807,67 @@ mod tests {
                     CHUNK_SIZE_USIZE - 1
                 ],
                 Direction::PosX,
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn top_face_ao_ignores_same_level_neighbors() {
+        let mut chunk = Chunk::empty(ChunkCoord::ZERO);
+        chunk.set_block(
+            LocalVoxelCoord::new_unchecked(1, 1, 1),
+            BlockState::new(BlockId::STONE),
+        );
+        for z in 0..=2 {
+            for x in 0..=2 {
+                if x == 1 && z == 1 {
+                    continue;
+                }
+                chunk.set_block(
+                    LocalVoxelCoord::new_unchecked(x, 1, z),
+                    BlockState::new(BlockId::STONE),
+                );
+            }
+        }
+
+        let opacity = opacity_table(&BlockRegistry::default());
+        assert_eq!(
+            face_ao(
+                chunk.blocks(),
+                ChunkNeighbors::default(),
+                &opacity,
+                [1, 1, 1],
+                Direction::PosY,
+            ),
+            0
+        );
+    }
+
+    #[test]
+    fn top_face_ao_samples_blocks_above_the_face() {
+        let mut chunk = Chunk::empty(ChunkCoord::ZERO);
+        chunk.set_block(
+            LocalVoxelCoord::new_unchecked(1, 1, 1),
+            BlockState::new(BlockId::STONE),
+        );
+        chunk.set_block(
+            LocalVoxelCoord::new_unchecked(0, 2, 0),
+            BlockState::new(BlockId::STONE),
+        );
+        chunk.set_block(
+            LocalVoxelCoord::new_unchecked(2, 2, 2),
+            BlockState::new(BlockId::STONE),
+        );
+
+        let opacity = opacity_table(&BlockRegistry::default());
+        assert_eq!(
+            face_ao(
+                chunk.blocks(),
+                ChunkNeighbors::default(),
+                &opacity,
+                [1, 1, 1],
+                Direction::PosY,
             ),
             1
         );

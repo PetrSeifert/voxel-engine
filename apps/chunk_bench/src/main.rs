@@ -77,6 +77,7 @@ fn neighbors_for<'a>(
 fn mesh_upload_bytes(mesh: &ChunkMesh) -> u64 {
     mesh.opaque_surfaces
         .iter()
+        .chain(mesh.transparent_surfaces.iter())
         .map(|surface| {
             surface.vertices.len() * std::mem::size_of::<voxel_mesh::MeshVertex>()
                 + surface.indices.len() * std::mem::size_of::<u32>()

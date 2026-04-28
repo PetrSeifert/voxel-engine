@@ -1,3 +1,4 @@
+use noise::{NoiseFn, Perlin};
 use serde::{Deserialize, Serialize};
 use std::{collections::HashMap, sync::Arc};
 use voxel_core::{
@@ -65,6 +66,34 @@ impl Default for BlockRegistry {
                     name: "water".to_owned(),
                     opaque: false,
                     atlas_tile: 4,
+                    emits_light: 0,
+                },
+                BlockMaterial {
+                    id: BlockId::SAND,
+                    name: "sand".to_owned(),
+                    opaque: true,
+                    atlas_tile: 5,
+                    emits_light: 0,
+                },
+                BlockMaterial {
+                    id: BlockId::WOOD,
+                    name: "wood".to_owned(),
+                    opaque: true,
+                    atlas_tile: 6,
+                    emits_light: 0,
+                },
+                BlockMaterial {
+                    id: BlockId::LEAVES,
+                    name: "leaves".to_owned(),
+                    opaque: false,
+                    atlas_tile: 7,
+                    emits_light: 0,
+                },
+                BlockMaterial {
+                    id: BlockId::SNOW,
+                    name: "snow".to_owned(),
+                    opaque: true,
+                    atlas_tile: 8,
                     emits_light: 0,
                 },
             ],
@@ -192,21 +221,300 @@ pub trait WorldGenerator: Send + Sync {
     fn generate_chunk(&self, coord: ChunkCoord) -> Chunk;
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+pub struct NaturalTerrainConfig {
+    pub sea_level: i32,
+    pub max_tree_height: i32,
+    pub max_tree_canopy_radius: i32,
+}
+
+impl Default for NaturalTerrainConfig {
+    fn default() -> Self {
+        Self {
+            sea_level: 24,
+            max_tree_height: 8,
+            max_tree_canopy_radius: 3,
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct TerrainGenerator {
     seed: u64,
+    config: NaturalTerrainConfig,
+    continental: Perlin,
+    elevation: Perlin,
+    detail: Perlin,
+    mountain: Perlin,
+    humidity: Perlin,
+    temperature: Perlin,
+    river: Perlin,
+    river_warp: Perlin,
+}
+
+impl std::fmt::Debug for TerrainGenerator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TerrainGenerator")
+            .field("seed", &self.seed)
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct TerrainColumn {
+    height: i32,
+    surface: BlockId,
+    humidity: f32,
+    temperature: f32,
+    river: bool,
+    water_level: Option<i32>,
 }
 
 impl TerrainGenerator {
     pub fn new(seed: u64) -> Self {
-        Self { seed }
+        Self::with_config(seed, NaturalTerrainConfig::default())
     }
 
-    fn height_at(&self, x: i32, z: i32) -> i32 {
-        let h = hash2(self.seed, x, z);
-        let low = (h & 0x0f) as i32;
-        let mid = ((h >> 8) & 0x07) as i32;
-        20 + low + mid - 4
+    pub fn with_config(seed: u64, config: NaturalTerrainConfig) -> Self {
+        Self {
+            seed,
+            config,
+            continental: Perlin::new(seed32(seed, 0)),
+            elevation: Perlin::new(seed32(seed, 1)),
+            detail: Perlin::new(seed32(seed, 2)),
+            mountain: Perlin::new(seed32(seed, 3)),
+            humidity: Perlin::new(seed32(seed, 4)),
+            temperature: Perlin::new(seed32(seed, 5)),
+            river: Perlin::new(seed32(seed, 6)),
+            river_warp: Perlin::new(seed32(seed, 7)),
+        }
+    }
+
+    pub fn config(&self) -> NaturalTerrainConfig {
+        self.config
+    }
+
+    pub fn height_at(&self, x: i32, z: i32) -> i32 {
+        self.sample_column(x, z).height
+    }
+
+    fn sample_column(&self, x: i32, z: i32) -> TerrainColumn {
+        let sea = self.config.sea_level;
+        let continental = (self.noise2(&self.continental, x, z, 520.0)
+            + self.noise2(&self.detail, x, z, 170.0) * 0.32)
+            .clamp(-1.0, 1.0);
+        let land = smoothstep(-0.20, 0.28, continental);
+        let plains = self.noise2(&self.elevation, x, z, 190.0);
+        let rolling = self.noise2(&self.detail, x, z, 68.0);
+        let mountain_gate = smoothstep(
+            0.30,
+            0.82,
+            self.noise2(&self.mountain, x, z, 420.0) * 0.72 + continental * 0.55,
+        );
+        let ridge = (1.0 - self.noise2(&self.mountain, x, z, 105.0).abs()).powf(2.6);
+        let mountain_lift =
+            mountain_gate * (ridge * 82.0 + self.noise2(&self.detail, x, z, 43.0).max(0.0) * 14.0);
+
+        let sea_floor = sea as f32 - 12.0 + (continental + 1.0) * 7.0;
+        let land_height = 28.0 + land * 12.0 + plains * 9.0 + rolling * 4.0 + mountain_lift;
+        let coast_height = lerp(sea as f32 - 3.0, land_height, land);
+        let mut height = if continental < -0.20 {
+            sea_floor
+        } else {
+            coast_height
+        };
+
+        let river_noise = (self.noise2(&self.river, x, z, 235.0)
+            + self.noise2(&self.river_warp, x, z, 82.0) * 0.28)
+            .abs();
+        let river_strength =
+            smoothstep(0.070, 0.018, river_noise) * smoothstep(0.02, 0.24, continental);
+        let river = river_strength > 0.20 && height > sea as f32 + 1.0;
+        let river_water_level = if river {
+            let coast_blend = smoothstep(0.08, 0.24, continental);
+            Some(
+                lerp(sea as f32, height, coast_blend)
+                    .round()
+                    .clamp(5.0, 128.0) as i32,
+            )
+        } else {
+            None
+        };
+        if river {
+            let carve_depth = (river_strength * 4.0).round().clamp(1.0, 4.0);
+            height -= carve_depth;
+            if let Some(water_level) = river_water_level {
+                height = height.min((water_level - 1) as f32);
+            }
+        }
+
+        let height = height.round().clamp(4.0, 128.0) as i32;
+        let water_level = if height < sea {
+            Some(sea)
+        } else if river {
+            river_water_level
+        } else {
+            None
+        };
+        let humidity = ((self.noise2(&self.humidity, x, z, 360.0) + 1.0) * 0.5).clamp(0.0, 1.0);
+        let temperature = (((self.noise2(&self.temperature, x, z, 430.0) + 1.0) * 0.5)
+            - (height as f32 - 48.0).max(0.0) / 120.0)
+            .clamp(0.0, 1.0);
+
+        let surface = if height <= sea + 1 || river {
+            BlockId::SAND
+        } else if height >= 88 && temperature < 0.42 {
+            BlockId::SNOW
+        } else if height >= 74 && mountain_gate > 0.42 {
+            BlockId::STONE
+        } else if continental < -0.02 || height <= sea + 3 {
+            BlockId::SAND
+        } else {
+            BlockId::GRASS
+        };
+
+        TerrainColumn {
+            height,
+            surface,
+            humidity,
+            temperature,
+            river,
+            water_level,
+        }
+    }
+
+    fn block_for_column_y(&self, column: TerrainColumn, world_y: i32) -> BlockState {
+        if world_y > column.height {
+            if column
+                .water_level
+                .is_some_and(|water_level| world_y <= water_level)
+            {
+                BlockState::new(BlockId::WATER)
+            } else {
+                BlockState::AIR
+            }
+        } else if world_y == column.height {
+            BlockState::new(column.surface)
+        } else if world_y >= column.height - 3 {
+            if column.surface == BlockId::SAND {
+                BlockState::new(BlockId::SAND)
+            } else {
+                BlockState::new(BlockId::DIRT)
+            }
+        } else {
+            BlockState::new(BlockId::STONE)
+        }
+    }
+
+    fn noise2(&self, noise: &Perlin, x: i32, z: i32, scale: f64) -> f32 {
+        noise.get([x as f64 / scale, z as f64 / scale]) as f32
+    }
+
+    fn should_place_tree(&self, x: i32, z: i32, column: TerrainColumn) -> bool {
+        if column.surface != BlockId::GRASS || column.height <= self.config.sea_level + 2 {
+            return false;
+        }
+        if column.river || column.temperature < 0.28 || column.height > 72 {
+            return false;
+        }
+
+        let forest_density = (column.humidity * 0.18 + 0.025).clamp(0.02, 0.20);
+        let patch = ((self.noise2(&self.humidity, x, z, 95.0) + 1.0) * 0.5).clamp(0.0, 1.0);
+        if patch < 0.42 {
+            return false;
+        }
+
+        hash_unit(self.seed ^ 0x7472_6565, x, z) < forest_density
+    }
+
+    fn tree_shape(&self, x: i32, z: i32) -> (i32, i32) {
+        let h = hash2(self.seed ^ 0x6f61_6b, x, z);
+        let max_height = self.config.max_tree_height.max(4);
+        let height = 4 + (h % (max_height - 3) as u64) as i32;
+        let canopy = 2 + ((h >> 8) & 0x01) as i32;
+        (
+            height,
+            canopy.min(self.config.max_tree_canopy_radius.max(2)),
+        )
+    }
+
+    fn tree_column_pad(&self) -> i32 {
+        self.config.max_tree_canopy_radius.max(2) + 1
+    }
+
+    fn place_trees_in_chunk(&self, chunk: &mut Chunk, columns: &mut TerrainColumnCache<'_>) {
+        let origin = chunk.coord.min_voxel();
+        let pad = self.tree_column_pad();
+        for root_z in origin.z - pad..origin.z + CHUNK_SIZE + pad {
+            for root_x in origin.x - pad..origin.x + CHUNK_SIZE + pad {
+                let column = columns.sample(root_x, root_z);
+                if !self.should_place_tree(root_x, root_z, column) {
+                    continue;
+                }
+                self.place_tree(chunk, root_x, column.height + 1, root_z);
+            }
+        }
+    }
+
+    fn place_tree(&self, chunk: &mut Chunk, root_x: i32, root_y: i32, root_z: i32) {
+        let (height, canopy_radius) = self.tree_shape(root_x, root_z);
+        for dy in 0..height {
+            set_block_if_in_chunk(
+                chunk,
+                VoxelCoord::new(root_x, root_y + dy, root_z),
+                BlockState::new(BlockId::WOOD),
+            );
+        }
+
+        let canopy_base = root_y + height - 2;
+        let canopy_top = root_y + height + 1;
+        for y in canopy_base..=canopy_top {
+            let layer_radius = if y == canopy_top {
+                canopy_radius - 1
+            } else {
+                canopy_radius
+            };
+            for z in root_z - layer_radius..=root_z + layer_radius {
+                for x in root_x - layer_radius..=root_x + layer_radius {
+                    let dist = (x - root_x).abs() + (z - root_z).abs();
+                    if dist > layer_radius + 1 {
+                        continue;
+                    }
+                    if x == root_x && z == root_z && y < root_y + height {
+                        continue;
+                    }
+                    set_block_if_replaceable(
+                        chunk,
+                        VoxelCoord::new(x, y, z),
+                        BlockState::new(BlockId::LEAVES),
+                    );
+                }
+            }
+        }
+    }
+}
+
+struct TerrainColumnCache<'a> {
+    generator: &'a TerrainGenerator,
+    columns: HashMap<(i32, i32), TerrainColumn>,
+}
+
+impl<'a> TerrainColumnCache<'a> {
+    fn with_capacity(generator: &'a TerrainGenerator, capacity: usize) -> Self {
+        Self {
+            generator,
+            columns: HashMap::with_capacity(capacity),
+        }
+    }
+
+    fn sample(&mut self, x: i32, z: i32) -> TerrainColumn {
+        if let Some(column) = self.columns.get(&(x, z)) {
+            return *column;
+        }
+        let column = self.generator.sample_column(x, z);
+        self.columns.insert((x, z), column);
+        column
     }
 }
 
@@ -214,28 +522,23 @@ impl WorldGenerator for TerrainGenerator {
     fn generate_chunk(&self, coord: ChunkCoord) -> Chunk {
         let mut chunk = Chunk::empty(coord);
         let origin = coord.min_voxel();
+        let cached_side = (CHUNK_SIZE + self.tree_column_pad() * 2) as usize;
+        let mut columns = TerrainColumnCache::with_capacity(self, cached_side * cached_side);
         for z in 0..CHUNK_SIZE {
             for x in 0..CHUNK_SIZE {
                 let world_x = origin.x + x;
                 let world_z = origin.z + z;
-                let height = self.height_at(world_x, world_z);
+                let column = columns.sample(world_x, world_z);
                 for y in 0..CHUNK_SIZE {
                     let world_y = origin.y + y;
-                    let state = if world_y > height {
-                        BlockState::AIR
-                    } else if world_y == height {
-                        BlockState::new(BlockId::GRASS)
-                    } else if world_y >= height - 3 {
-                        BlockState::new(BlockId::DIRT)
-                    } else {
-                        BlockState::new(BlockId::STONE)
-                    };
+                    let state = self.block_for_column_y(column, world_y);
                     let index =
                         (y as usize * CHUNK_AREA) + (z as usize * CHUNK_SIZE_USIZE) + x as usize;
                     chunk.blocks[index] = state;
                 }
             }
         }
+        self.place_trees_in_chunk(&mut chunk, &mut columns);
         compute_basic_skylight(&mut chunk);
         chunk.clear_dirty();
         chunk
@@ -248,7 +551,7 @@ pub fn compute_basic_skylight(chunk: &mut Chunk) {
             let mut light = 15;
             for y in (0..CHUNK_SIZE_USIZE).rev() {
                 let index = (y * CHUNK_AREA) + (z * CHUNK_SIZE_USIZE) + x;
-                if !chunk.blocks[index].is_air() {
+                if blocks_skylight(chunk.blocks[index]) {
                     light = 0;
                 }
                 chunk.light.skylight[index] = light;
@@ -256,6 +559,10 @@ pub fn compute_basic_skylight(chunk: &mut Chunk) {
         }
     }
     chunk.dirty = true;
+}
+
+fn blocks_skylight(state: BlockState) -> bool {
+    !matches!(state.id, BlockId::AIR | BlockId::WATER | BlockId::LEAVES)
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -496,6 +803,45 @@ impl StreamPlanner {
     }
 }
 
+fn set_block_if_in_chunk(chunk: &mut Chunk, voxel: VoxelCoord, state: BlockState) {
+    let (coord, local) = voxel.split_chunk_local();
+    if coord == chunk.coord {
+        chunk.blocks[local.index()] = state;
+    }
+}
+
+fn set_block_if_replaceable(chunk: &mut Chunk, voxel: VoxelCoord, state: BlockState) {
+    let (coord, local) = voxel.split_chunk_local();
+    if coord != chunk.coord {
+        return;
+    }
+    let index = local.index();
+    if matches!(chunk.blocks[index].id, BlockId::AIR | BlockId::LEAVES) {
+        chunk.blocks[index] = state;
+    }
+}
+
+fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
+    if edge0 == edge1 {
+        return if x < edge0 { 0.0 } else { 1.0 };
+    }
+    let t = ((x - edge0) / (edge1 - edge0)).clamp(0.0, 1.0);
+    t * t * (3.0 - 2.0 * t)
+}
+
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+fn seed32(seed: u64, stream: u32) -> u32 {
+    (seed ^ (stream as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ (seed >> 32)) as u32
+}
+
+fn hash_unit(seed: u64, x: i32, z: i32) -> f32 {
+    let h = hash2(seed, x, z);
+    ((h >> 40) as u32) as f32 / (1u32 << 24) as f32
+}
+
 fn hash2(seed: u64, x: i32, z: i32) -> u64 {
     let mut h = seed ^ (x as u64).wrapping_mul(0x9e37_79b9_7f4a_7c15);
     h ^= (z as u64).wrapping_mul(0xbf58_476d_1ce4_e5b9);
@@ -526,6 +872,97 @@ mod tests {
     }
 
     #[test]
+    fn different_seeds_generate_different_chunks() {
+        let a = TerrainGenerator::new(7).generate_chunk(ChunkCoord::ZERO);
+        let b = TerrainGenerator::new(8).generate_chunk(ChunkCoord::ZERO);
+        assert_ne!(a.blocks(), b.blocks());
+    }
+
+    #[test]
+    fn negative_coordinates_generate_stably() {
+        let generator = TerrainGenerator::new(11);
+        let coord = ChunkCoord::new(-4, 1, -7);
+        assert_eq!(
+            generator.generate_chunk(coord).blocks(),
+            generator.generate_chunk(coord).blocks()
+        );
+    }
+
+    #[test]
+    fn ocean_columns_fill_water_to_sea_level() {
+        let generator = TerrainGenerator::new(0x5eed);
+        let sea = generator.config().sea_level;
+        let (x, z, column) = find_column(&generator, |column| column.height < sea - 2)
+            .expect("seed should contain ocean in sampled area");
+        assert_eq!(
+            generated_block(&generator, VoxelCoord::new(x, sea, z)).id,
+            BlockId::WATER
+        );
+        assert_eq!(column.surface, BlockId::SAND);
+    }
+
+    #[test]
+    fn river_corridors_fill_with_water() {
+        let generator = TerrainGenerator::new(0x5eed);
+        let (x, z, column) = find_column(&generator, |column| column.river)
+            .expect("seed should contain a river corridor in sampled area");
+        let river_water_level = column.water_level.expect("river should have local water");
+        assert!(river_water_level > column.height);
+        assert_eq!(
+            generated_block(&generator, VoxelCoord::new(x, river_water_level, z)).id,
+            BlockId::WATER
+        );
+        assert_eq!(
+            generated_block(&generator, VoxelCoord::new(x, column.height + 1, z)).id,
+            BlockId::WATER
+        );
+    }
+
+    #[test]
+    fn sampled_world_contains_mountain_elevations() {
+        let generator = TerrainGenerator::new(0x5eed);
+        let max_height = sample_columns(&generator)
+            .map(|(_, _, column)| column.height)
+            .max()
+            .unwrap();
+        assert!(max_height >= 88, "max sampled height was {max_height}");
+    }
+
+    #[test]
+    fn trees_only_root_on_valid_land_surfaces() {
+        let generator = TerrainGenerator::new(0x5eed);
+        let (x, z, column) = sample_columns(&generator)
+            .find(|&(x, z, column)| generator.should_place_tree(x, z, column))
+            .expect("seed should place at least one tree in sampled area");
+        assert_eq!(column.surface, BlockId::GRASS);
+        assert!(column.height > generator.config().sea_level + 2);
+        assert!(!column.river);
+        assert_eq!(
+            generated_block(&generator, VoxelCoord::new(x, column.height + 1, z)).id,
+            BlockId::WOOD
+        );
+    }
+
+    #[test]
+    fn tree_canopies_generate_across_chunk_boundaries() {
+        let generator = TerrainGenerator::new(0x5eed);
+        let (root_x, root_z, column, canopy_radius) = find_boundary_tree(&generator)
+            .expect("seed should place at least one boundary-crossing tree");
+
+        let leaf_voxel = VoxelCoord::new(
+            root_x + canopy_radius,
+            column.height + generator.tree_shape(root_x, root_z).0,
+            root_z,
+        );
+        let root_chunk = VoxelCoord::new(root_x, column.height + 1, root_z)
+            .split_chunk_local()
+            .0;
+        let leaf_chunk = leaf_voxel.split_chunk_local().0;
+        assert_ne!(leaf_chunk.x, root_chunk.x);
+        assert_eq!(generated_block(&generator, leaf_voxel).id, BlockId::LEAVES);
+    }
+
+    #[test]
     fn edit_log_replay_changes_generated_chunk() {
         let mut log = InMemoryEditLogStore::default();
         let voxel = VoxelCoord::new(1, 1, 1);
@@ -543,8 +980,83 @@ mod tests {
     }
 
     #[test]
+    fn water_and_leaves_do_not_block_basic_skylight() {
+        let mut chunk = Chunk::empty(ChunkCoord::ZERO);
+        chunk.set_block(
+            LocalVoxelCoord::new_unchecked(1, 30, 1),
+            BlockState::new(BlockId::WATER),
+        );
+        chunk.set_block(
+            LocalVoxelCoord::new_unchecked(1, 29, 1),
+            BlockState::new(BlockId::LEAVES),
+        );
+        compute_basic_skylight(&mut chunk);
+
+        assert_eq!(
+            chunk
+                .light()
+                .skylight(LocalVoxelCoord::new_unchecked(1, 28, 1)),
+            15
+        );
+
+        chunk.set_block(
+            LocalVoxelCoord::new_unchecked(1, 27, 1),
+            BlockState::new(BlockId::STONE),
+        );
+        compute_basic_skylight(&mut chunk);
+
+        assert_eq!(
+            chunk
+                .light()
+                .skylight(LocalVoxelCoord::new_unchecked(1, 26, 1)),
+            0
+        );
+    }
+
+    #[test]
     fn streaming_state_rejects_skipped_steps() {
         assert!(ChunkStreamingState::Missing.can_transition_to(ChunkStreamingState::Generating));
         assert!(!ChunkStreamingState::Missing.can_transition_to(ChunkStreamingState::Meshing));
+    }
+
+    fn generated_block(generator: &TerrainGenerator, voxel: VoxelCoord) -> BlockState {
+        let (coord, local) = voxel.split_chunk_local();
+        generator.generate_chunk(coord).block(local)
+    }
+
+    fn find_column(
+        generator: &TerrainGenerator,
+        predicate: impl Fn(TerrainColumn) -> bool,
+    ) -> Option<(i32, i32, TerrainColumn)> {
+        sample_columns(generator).find(|&(_, _, column)| predicate(column))
+    }
+
+    fn sample_columns(
+        generator: &TerrainGenerator,
+    ) -> impl Iterator<Item = (i32, i32, TerrainColumn)> + '_ {
+        (-1024..=1024).step_by(8).flat_map(move |z| {
+            (-1024..=1024)
+                .step_by(8)
+                .map(move |x| (x, z, generator.sample_column(x, z)))
+        })
+    }
+
+    fn find_boundary_tree(generator: &TerrainGenerator) -> Option<(i32, i32, TerrainColumn, i32)> {
+        for chunk_x in -32..=32 {
+            for local_x in [30, 31] {
+                let x = chunk_x * CHUNK_SIZE + local_x;
+                for z in (-1024..=1024).step_by(4) {
+                    let column = generator.sample_column(x, z);
+                    if !generator.should_place_tree(x, z, column) {
+                        continue;
+                    }
+                    let (_, canopy_radius) = generator.tree_shape(x, z);
+                    if x.rem_euclid(CHUNK_SIZE) >= CHUNK_SIZE - canopy_radius {
+                        return Some((x, z, column, canopy_radius));
+                    }
+                }
+            }
+        }
+        None
     }
 }

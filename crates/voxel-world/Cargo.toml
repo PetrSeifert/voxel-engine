@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+noise.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 voxel-core.workspace = true

@@ -11,8 +11,18 @@ vec3 material_color(uint material) {
     if (material == 1) return vec3(0.42, 0.43, 0.45);
     if (material == 2) return vec3(0.43, 0.28, 0.16);
     if (material == 3) return vec3(0.22, 0.58, 0.20);
-    if (material == 4) return vec3(0.12, 0.35, 0.80);
+    if (material == 4) return vec3(0.10, 0.34, 0.74);
+    if (material == 5) return vec3(0.78, 0.67, 0.42);
+    if (material == 6) return vec3(0.36, 0.20, 0.10);
+    if (material == 7) return vec3(0.13, 0.42, 0.16);
+    if (material == 8) return vec3(0.88, 0.94, 0.96);
     return vec3(0.90, 0.15, 0.75);
+}
+
+float material_alpha(uint material) {
+    if (material == 4) return 0.58;
+    if (material == 7) return 0.68;
+    return 1.0;
 }
 
 void main() {
@@ -21,5 +31,5 @@ void main() {
     float ao = 1.0 - clamp(float(in_ao) / 4.0, 0.0, 0.75);
     vec2 tile = abs(fract(in_uv) - vec2(0.5));
     float edge = 1.0 - 0.08 * step(0.47, max(tile.x, tile.y));
-    out_color = vec4(material_color(in_material) * ndotl * ao * edge, 1.0);
+    out_color = vec4(material_color(in_material) * ndotl * ao * edge, material_alpha(in_material));
 }
